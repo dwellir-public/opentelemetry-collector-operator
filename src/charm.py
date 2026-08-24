@@ -23,6 +23,7 @@ from ops import BlockedStatus, CharmBase, RelationChangedEvent
 from ops.model import ActiveStatus, MaintenanceStatus, WaitingStatus
 from tenacity import retry, stop_after_attempt, wait_fixed
 
+import apt_management
 import integrations
 from config_builder import Component, Port, build_port_map
 from config_manager import ConfigManager
@@ -35,6 +36,9 @@ from constants import (
     LOGROTATE_SRC_PATH,
     LOKI_RULES_DEST_PATH,
     METRICS_RULES_DEST_PATH,
+    NODE_EXPORTER_APT_PACKAGE,
+    NODE_EXPORTER_APT_SERVICE,
+    NODE_EXPORTER_APT_TEXTFILE_DIRECTORY,
     NODE_EXPORTER_DISABLED_COLLECTORS,
     NODE_EXPORTER_ENABLED_COLLECTORS,
     NODE_EXPORTER_TEXTFILE_DIRECTORY,
@@ -234,11 +238,25 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
                 )
                 return
 
+        # Validate the node-exporter package-type config
+        if self._node_exporter_package_type not in ("snap", "apt"):
+            self.unit.status = BlockedStatus("Invalid package-type config: must be 'snap' or 'apt'")
+            return
+
         # Parse port overrides from Juju config
         try:
             port_map = build_port_map(cast(str, self.config.get("ports")))
         except ValueError as e:
             self.unit.status = BlockedStatus(f"Invalid ports config: {e}")
+            return
+
+        # The stock deb listens on :9100 and the charm does not manage its config,
+        # so a node_exporter port override can only be honored by the snap flavor.
+        if (
+            self._node_exporter_package_type == "apt"
+            and port_map[Port.node_exporter.name] != Port.node_exporter.value
+        ):
+            self.unit.status = BlockedStatus("node_exporter port override requires package-type=snap")
             return
 
         # Create the config manager
@@ -533,7 +551,7 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
             [config_manager.config.hash, receive_ca_certs_hash, server_cert_hash]
         )
         if current_hash != old_hash:
-            for snap_name in SnapMap.snaps():
+            for snap_name in self._managed_snaps():
                 self._restart_snap(self.snap(snap_name))
             hash_file.write_text(current_hash)
 
@@ -550,7 +568,7 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
         # Start the otelcol snap in case it was stopped while waiting for certificates
         self.snap("opentelemetry-collector").start()
 
-        for snap_name in SnapMap.snaps():
+        for snap_name in self._managed_snaps():
             snap_revision = SnapMap.get_revision(snap_name)
             revisions = SingletonSnapManager.get_revisions(snap_name)
             installed_revision = max(revisions) if revisions else None
@@ -566,8 +584,15 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
                 self.unit.status = BlockedStatus(f"Mismatching snap revisions for {snap_name}")
                 return
 
-        self._ensure_directory(NODE_EXPORTER_TEXTFILE_DIRECTORY)
-        self._configure_node_exporter(port_map[Port.node_exporter.name])
+        self._sync_node_exporter_package(port_map[Port.node_exporter.name])
+
+        if self._node_exporter_flavor_conflict():
+            self.unit.status = BlockedStatus(
+                "Another unit on this machine uses the other node-exporter package-type; "
+                "align the package-type config on all collector apps sharing this machine"
+            )
+            return
+
         self.unit.status = ActiveStatus()
 
         if not valid_mem_limit:
@@ -598,10 +623,39 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
             return result
         return result.group(1)
 
+    def _managed_snaps(self) -> List[str]:
+        """Snaps this unit manages given the current config.
+
+        node-exporter is only snap-managed when package-type is 'snap'; otherwise it
+        is handled by apt (see _sync_node_exporter_package).
+        """
+        snaps = ["opentelemetry-collector"]
+        if self._node_exporter_package_type == "snap":
+            snaps.append("node-exporter")
+        return snaps
+
+    def _node_exporter_flavor_conflict(self) -> bool:
+        """True when a co-located unit has node-exporter registered via the other flavor.
+
+        Both flavors would fight over the node-exporter port, so this is surfaced as
+        BlockedStatus. A same-application flavor switch trips this only transiently:
+        once every unit has reconciled, the old flavor's registrations are gone.
+        """
+        manager = SingletonSnapManager(self.unit.name)
+        other_flavor = (
+            "node-exporter" if self._node_exporter_package_type == "apt" else NODE_EXPORTER_APT_PACKAGE
+        )
+        return manager.is_used_by_other_units(other_flavor)
+
     def _install_snaps(self) -> None:
         manager = SingletonSnapManager(self.unit.name)
 
-        for snap_name in SnapMap.snaps():
+        if self._node_exporter_package_type == "apt":
+            # The deb has no pinned revision; register with a constant 0 so the
+            # lockfile-based reference counting works the same as for snaps.
+            manager.register(NODE_EXPORTER_APT_PACKAGE, 0)
+
+        for snap_name in self._managed_snaps():
             snap_revision = SnapMap.get_revision(snap_name)
             manager.register(snap_name, snap_revision)
             revisions = manager.get_revisions(snap_name)
@@ -628,18 +682,29 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
             # Don't raise the exception to avoid failing the remove hook
 
     def _remove_node_exporter(self):
-        """Coordinate node-exporter snap removal."""
+        """Coordinate removal of node-exporter, whichever flavor(s) are present."""
         manager = SingletonSnapManager(self.unit.name)
-        snap_name = "node-exporter"
-        manager.unregister_all_for_unit(snap_name)
-        if not manager.is_used_by_other_units(snap_name):
-            self._remove_snap(snap_name)
+        manager.unregister_all_for_unit("node-exporter")
+        manager.unregister_all_for_unit(NODE_EXPORTER_APT_PACKAGE)
+        if not manager.is_used_by_other_units("node-exporter"):
+            self._remove_snap("node-exporter")
+        if not manager.is_used_by_other_units(
+            NODE_EXPORTER_APT_PACKAGE
+        ) and apt_management.is_installed(NODE_EXPORTER_APT_PACKAGE):
+            self.unit.status = MaintenanceStatus(f"Uninstalling {NODE_EXPORTER_APT_PACKAGE} deb")
+            try:
+                apt_management.remove_package(NODE_EXPORTER_APT_PACKAGE)
+            except apt_management.AptError as e:
+                # Log error but don't fail the remove hook
+                logger.error(f"Failed to uninstall {NODE_EXPORTER_APT_PACKAGE} deb: {e}")
 
-        self._remove_node_exporter_info_metric_file()
+        # Clean up this unit's info-metric file from both flavor directories
+        for directory in (NODE_EXPORTER_TEXTFILE_DIRECTORY, NODE_EXPORTER_APT_TEXTFILE_DIRECTORY):
+            self._remove_node_exporter_info_metric_file(directory)
 
-    def _remove_node_exporter_info_metric_file(self):
-        """Remove the node-exporter info metrics file."""
-        path = self._node_exporter_info_metric_file_path
+    def _remove_node_exporter_info_metric_file(self, directory: str):
+        """Remove this unit's node-exporter info metrics file from the given textfile dir."""
+        path = LocalPath(directory) / f"{self.unit.name.replace('/', '_')}.prom"
         try:
             existed = path.exists()
             path.unlink(missing_ok=True)
@@ -712,6 +777,57 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
         charm_root = self.charm_dir.absolute()
         with open(charm_root.joinpath(*LOGROTATE_SRC_PATH.split("/")), "r") as f:
             config_path.write_text(f.read())
+
+    def _sync_node_exporter_package(self, port: int) -> None:
+        """Converge node-exporter onto the configured package flavor.
+
+        Uninstalls the other flavor when this unit is its last registered user
+        (see SingletonSnapManager) and installs the desired flavor if missing.
+        The apt flavor is intentionally left with the deb's stock configuration;
+        the snap flavor keeps the existing snap-set configuration path.
+        """
+        manager = SingletonSnapManager(self.unit.name)
+        if self._node_exporter_package_type == "apt":
+            # Drop the snap flavor if this unit is its last user
+            manager.unregister_all_for_unit("node-exporter")
+            if (
+                not manager.is_used_by_other_units("node-exporter")
+                and self.snap("node-exporter").present
+            ):
+                self._remove_snap("node-exporter")
+            if not apt_management.is_installed(NODE_EXPORTER_APT_PACKAGE):
+                self.unit.status = MaintenanceStatus(f"Installing {NODE_EXPORTER_APT_PACKAGE} deb")
+                apt_management.install_package(NODE_EXPORTER_APT_PACKAGE)
+            manager.register(NODE_EXPORTER_APT_PACKAGE, 0)
+            # The service may be down if it failed to bind :9100 while the snap
+            # flavor still held the port (e.g. mid-switch across several units).
+            apt_management.ensure_service_running(NODE_EXPORTER_APT_SERVICE)
+            self._ensure_directory(self._node_exporter_textfile_dir)
+            self._node_exporter_info_metric_file_path.write_text(self._info_metric)
+        else:
+            # Drop the apt flavor if this unit is its last user
+            manager.unregister_all_for_unit(NODE_EXPORTER_APT_PACKAGE)
+            apt_removed = False
+            if not manager.is_used_by_other_units(
+                NODE_EXPORTER_APT_PACKAGE
+            ) and apt_management.is_installed(NODE_EXPORTER_APT_PACKAGE):
+                self.unit.status = MaintenanceStatus(
+                    f"Uninstalling {NODE_EXPORTER_APT_PACKAGE} deb"
+                )
+                apt_management.remove_package(NODE_EXPORTER_APT_PACKAGE)
+                apt_removed = True
+            if not self.snap("node-exporter").present:
+                self.unit.status = MaintenanceStatus("Installing node-exporter snap")
+                install_snap("node-exporter")
+                try:
+                    self.snap("node-exporter").start(enable=True)
+                except snap.SnapError as e:
+                    raise SnapServiceError("Failed to start node-exporter") from e
+            manager.register("node-exporter", SnapMap.get_revision("node-exporter"))
+            self._ensure_directory(self._node_exporter_textfile_dir)
+            self._configure_node_exporter(port)
+            if apt_removed:
+                self._restart_snap(self.snap("node-exporter"))
 
     # We use tenacity because .set() performs a HTTP request to the snapd server which is not always ready
     @retry(stop=stop_after_attempt(5), wait=wait_fixed(5))
@@ -878,12 +994,28 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
         return any(self.model.relations.get("receive-server-cert", []))
 
     @property
+    def _node_exporter_package_type(self) -> str:
+        """The configured package source for node-exporter ('snap' or 'apt')."""
+        return cast(str, self.config.get("package-type"))
+
+    @property
+    def _node_exporter_textfile_dir(self) -> str:
+        """Directory scraped by node-exporter's textfile collector for the active package flavor.
+
+        For the apt flavor this is the directory the Debian packaging points the textfile
+        collector at by default; the charm only ever writes its info-metric file there.
+        """
+        if self._node_exporter_package_type == "apt":
+            return NODE_EXPORTER_APT_TEXTFILE_DIRECTORY
+        return NODE_EXPORTER_TEXTFILE_DIRECTORY
+
+    @property
     def _node_exporter_info_metric_file_path(self) -> LocalPath:
         """Avoid duplicating node exporter metrics per principal unit.
 
         Accomplished by enabling the textfile collector and "scraping" metrics from a text file generated by this charm for every cos_agent relation.
         """
-        return LocalPath(NODE_EXPORTER_TEXTFILE_DIRECTORY) / f"{self.unit.name.replace('/','_')}.prom"
+        return LocalPath(self._node_exporter_textfile_dir) / f"{self.unit.name.replace('/','_')}.prom"
 
     @property
     def _related_unit_pairs(self) -> list[tuple[str, str]]:
