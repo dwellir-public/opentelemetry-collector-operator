@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from ops.testing import State
 
+import apt_management
 from constants import NODE_EXPORTER_APT_PACKAGE
 from singleton_snap import SingletonSnapManager
 
@@ -104,7 +105,8 @@ def test_apt_mode_does_not_configure_node_exporter(ctx, mock_apt_operations):
     ):
         # WHEN the reconciler runs
         ctx.run(ctx.on.config_changed(), State())
-    # THEN the snap-flavor configuration path is never invoked (deb keeps stock config)
+    # THEN the snap-flavor configuration path is never invoked
+    # (the deb is configured via its ARGS defaults file instead)
     mock_cfg.assert_not_called()
 
 
@@ -228,3 +230,32 @@ def test_no_conflict_when_all_units_agree(ctx, mock_apt_operations):
     state_out = ctx.run(ctx.on.config_changed(), State())
     # THEN the unit is not blocked over package-type
     assert "package-type" not in getattr(state_out.unit_status, "message", "")
+
+
+def test_apt_service_restart_failure_blocks_instead_of_crashing(ctx, mock_apt_operations):
+    """Regression: a failed systemctl restart must not fail the hook.
+
+    On jammy the deb is 1.3.1; before version-gating the ARGS flags, the service
+    could not start and the raised SystemdError wedged the unit in error state.
+    """
+    # GIVEN apt mode with the deb installed but a service that fails to restart
+    mock_apt_operations["is_installed"].return_value = True
+    mock_apt_operations["sync_config"].side_effect = apt_management.AptServiceError("boom")
+    # WHEN the reconciler runs
+    state_out = ctx.run(ctx.on.config_changed(), State())
+    # THEN the hook completes with a blocked status instead of raising
+    assert state_out.unit_status.name == "blocked"
+    assert "failed to restart" in state_out.unit_status.message
+
+
+def test_apt_install_failure_blocks_instead_of_crashing(ctx, mock_apt_operations):
+    # GIVEN apt mode where installing the deb fails
+    with patch(
+        "apt_management.install_package",
+        side_effect=apt_management.AptInstallError("no candidate"),
+    ):
+        # WHEN the reconciler runs
+        state_out = ctx.run(ctx.on.config_changed(), State())
+    # THEN the hook completes with a blocked status instead of raising
+    assert state_out.unit_status.name == "blocked"
+    assert "Failed to install" in state_out.unit_status.message

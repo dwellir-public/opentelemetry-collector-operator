@@ -574,7 +574,9 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
                 self.unit.status = BlockedStatus(f"Mismatching snap revisions for {snap_name}")
                 return
 
-        self._sync_node_exporter_package(port_map[Port.node_exporter.name])
+        if sync_error := self._sync_node_exporter_package(port_map[Port.node_exporter.name]):
+            self.unit.status = BlockedStatus(sync_error)
+            return
 
         if self._node_exporter_flavor_conflict():
             self.unit.status = BlockedStatus(
@@ -771,13 +773,19 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
         with open(charm_root.joinpath(*LOGROTATE_SRC_PATH.split("/")), "r") as f:
             config_path.write_text(f.read())
 
-    def _sync_node_exporter_package(self, port: int) -> None:
+    def _sync_node_exporter_package(self, port: int) -> Optional[str]:
         """Converge node-exporter onto the configured package flavor.
 
         Uninstalls the other flavor when this unit is its last registered user
         (see SingletonSnapManager) and installs the desired flavor if missing.
         Both flavors are configured with the same collector set and listen port:
         the snap via `snap set`, the deb via its ARGS defaults file.
+
+        Returns:
+            An error message for BlockedStatus if the apt flavor could not be
+            installed or its service could not be restarted, None otherwise.
+            Failures must not raise: an unhandled exception here fails the hook
+            and wedges the unit in error state.
         """
         manager = SingletonSnapManager(self.unit.name)
         if self._node_exporter_package_type == "apt":
@@ -792,38 +800,47 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
                 snap_removed = True
             if not apt_management.is_installed(NODE_EXPORTER_APT_PACKAGE):
                 self.unit.status = MaintenanceStatus(f"Installing {NODE_EXPORTER_APT_PACKAGE} deb")
-                apt_management.install_package(NODE_EXPORTER_APT_PACKAGE)
+                try:
+                    apt_management.install_package(NODE_EXPORTER_APT_PACKAGE)
+                except apt_management.AptInstallError as e:
+                    logger.error(f"Failed to install {NODE_EXPORTER_APT_PACKAGE}: {e}")
+                    return f"Failed to install {NODE_EXPORTER_APT_PACKAGE} from apt; see debug-log"
             manager.register(NODE_EXPORTER_APT_PACKAGE, 0)
             self._ensure_directory(self._node_exporter_textfile_dir)
+            self._node_exporter_info_metric_file_path.write_text(self._info_metric)
             # Writes the ARGS defaults file and restarts the service when the config
             # changed or the service is down (e.g. it failed to bind :9100 while the
             # snap flavor still held the port mid-switch across several units).
-            apt_management.sync_node_exporter_config(port, force_restart=snap_removed)
-            self._node_exporter_info_metric_file_path.write_text(self._info_metric)
-        else:
-            # Drop the apt flavor if this unit is its last user
-            manager.unregister_all_for_unit(NODE_EXPORTER_APT_PACKAGE)
-            apt_removed = False
-            if not manager.is_used_by_other_units(
-                NODE_EXPORTER_APT_PACKAGE
-            ) and apt_management.is_installed(NODE_EXPORTER_APT_PACKAGE):
-                self.unit.status = MaintenanceStatus(
-                    f"Uninstalling {NODE_EXPORTER_APT_PACKAGE} deb"
-                )
-                apt_management.remove_package(NODE_EXPORTER_APT_PACKAGE)
-                apt_removed = True
-            if not self.snap("node-exporter").present:
-                self.unit.status = MaintenanceStatus("Installing node-exporter snap")
-                install_snap("node-exporter")
-                try:
-                    self.snap("node-exporter").start(enable=True)
-                except snap.SnapError as e:
-                    raise SnapServiceError("Failed to start node-exporter") from e
-            manager.register("node-exporter", SnapMap.get_revision("node-exporter"))
-            self._ensure_directory(self._node_exporter_textfile_dir)
-            self._configure_node_exporter(port)
-            if apt_removed:
-                self._restart_snap(self.snap("node-exporter"))
+            try:
+                apt_management.sync_node_exporter_config(port, force_restart=snap_removed)
+            except apt_management.AptServiceError as e:
+                logger.error(f"node-exporter (apt) service failed to restart: {e}")
+                return f"{NODE_EXPORTER_APT_PACKAGE} service failed to restart; see debug-log"
+            return None
+        # Drop the apt flavor if this unit is its last user
+        manager.unregister_all_for_unit(NODE_EXPORTER_APT_PACKAGE)
+        apt_removed = False
+        if not manager.is_used_by_other_units(
+            NODE_EXPORTER_APT_PACKAGE
+        ) and apt_management.is_installed(NODE_EXPORTER_APT_PACKAGE):
+            self.unit.status = MaintenanceStatus(
+                f"Uninstalling {NODE_EXPORTER_APT_PACKAGE} deb"
+            )
+            apt_management.remove_package(NODE_EXPORTER_APT_PACKAGE)
+            apt_removed = True
+        if not self.snap("node-exporter").present:
+            self.unit.status = MaintenanceStatus("Installing node-exporter snap")
+            install_snap("node-exporter")
+            try:
+                self.snap("node-exporter").start(enable=True)
+            except snap.SnapError as e:
+                raise SnapServiceError("Failed to start node-exporter") from e
+        manager.register("node-exporter", SnapMap.get_revision("node-exporter"))
+        self._ensure_directory(self._node_exporter_textfile_dir)
+        self._configure_node_exporter(port)
+        if apt_removed:
+            self._restart_snap(self.snap("node-exporter"))
+        return None
 
     # We use tenacity because .set() performs a HTTP request to the snapd server which is not always ready
     @retry(stop=stop_after_attempt(5), wait=wait_fixed(5))
