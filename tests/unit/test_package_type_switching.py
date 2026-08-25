@@ -259,3 +259,32 @@ def test_apt_install_failure_blocks_instead_of_crashing(ctx, mock_apt_operations
     # THEN the hook completes with a blocked status instead of raising
     assert state_out.unit_status.name == "blocked"
     assert "Failed to install" in state_out.unit_status.message
+
+
+# Captured at import time, before the autouse mock_singleton_snap_manager fixture
+# replaces it, so tests can exercise the real lockfile-based implementation.
+_real_get_revisions = SingletonSnapManager.get_revisions
+
+
+def test_switch_to_snap_with_no_registrations_does_not_block_on_mismatch(
+    ctx, mock_apt_operations
+):
+    """Regression: switching apt->snap deadlocked on 'Mismatching snap revisions'.
+
+    The revision-mismatch check runs before _sync_node_exporter_package has
+    installed and registered the snap; with no lockfiles at all there is
+    nothing to conflict with, so the check must not block the switch.
+    """
+    # GIVEN a unit running the deb (no node-exporter snap lockfiles exist)
+    mock_apt_operations["is_installed"].return_value = True
+    with (
+        patch("singleton_snap.SingletonSnapManager.get_revisions", _real_get_revisions),
+        patch("charm.install_snap") as mock_install,
+    ):
+        # WHEN package-type is switched to snap
+        state_out = ctx.run(ctx.on.config_changed(), State(config={"package-type": "snap"}))
+    # THEN the unit does not block on a bogus revision mismatch
+    assert "Mismatching snap revisions" not in getattr(state_out.unit_status, "message", "")
+    # AND the snap actually gets installed and registered in the same reconcile
+    assert "node-exporter" in {call.args[0] for call in mock_install.call_args_list}
+    assert SingletonSnapManager.get_units("node-exporter") == {"otelcol_0"}

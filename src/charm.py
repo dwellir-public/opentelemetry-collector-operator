@@ -561,7 +561,14 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
         for snap_name in self._managed_snaps():
             snap_revision = SnapMap.get_revision(snap_name)
             revisions = SingletonSnapManager.get_revisions(snap_name)
-            installed_revision = max(revisions) if revisions else None
+            if not revisions:
+                # No unit has registered this snap yet, so there is nothing to
+                # conflict with. This happens when package-type just switched to
+                # 'snap': the snap is installed and registered later in this same
+                # reconcile by _sync_node_exporter_package, so blocking here would
+                # deadlock the switch.
+                continue
+            installed_revision = max(revisions)
             if snap_revision != installed_revision:
                 logger.error(
                     f"Mismatching snap revisions for {snap_name}. "
