@@ -62,16 +62,28 @@ def test_install_hook_installs_node_exporter_snap_in_snap_mode(ctx):
 
 def test_apt_mode_installs_deb(ctx, mock_apt_operations):
     # GIVEN apt mode and the deb not yet installed
-    with (
-        patch("apt_management.install_package") as mock_install,
-        patch("apt_management.ensure_service_running") as mock_ensure,
-    ):
+    with patch("apt_management.install_package") as mock_install:
         # WHEN the reconciler runs
         ctx.run(ctx.on.config_changed(), State())
-    # THEN the deb is installed with its stock configuration (no config calls exist)
+    # THEN the deb is installed
     mock_install.assert_called_once_with(NODE_EXPORTER_APT_PACKAGE)
-    # AND the service is kept running
-    mock_ensure.assert_called_once_with("prometheus-node-exporter")
+    # AND its ARGS defaults file is synced with the node-exporter port
+    mock_apt_operations["sync_config"].assert_called_once()
+    assert mock_apt_operations["sync_config"].call_args.args[0] == 9100
+
+
+def test_apt_mode_honors_port_override(ctx, mock_apt_operations):
+    # GIVEN apt mode with a node_exporter port override
+    with patch("apt_management.install_package"):
+        # WHEN the reconciler runs
+        state_out = ctx.run(
+            ctx.on.config_changed(), State(config={"ports": "node_exporter=9200"})
+        )
+    # THEN the overridden port is written to the ARGS defaults file
+    mock_apt_operations["sync_config"].assert_called_once()
+    assert mock_apt_operations["sync_config"].call_args.args[0] == 9200
+    # AND the unit is not blocked over the override
+    assert "port override" not in getattr(state_out.unit_status, "message", "")
 
 
 def test_apt_mode_skips_install_when_already_installed(ctx, mock_apt_operations):

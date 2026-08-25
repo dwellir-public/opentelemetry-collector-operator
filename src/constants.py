@@ -27,6 +27,8 @@ FILE_STORAGE_DIRECTORY: Final[str] = "/var/snap/opentelemetry-collector/common/"
 NODE_EXPORTER_TEXTFILE_DIRECTORY: Final[str] = "/var/snap/node-exporter/common/textfile-collector.d"
 # Ref: https://github.com/prometheus/node_exporter?tab=readme-ov-file#collectors
 NODE_EXPORTER_DISABLED_COLLECTORS: Final[Set[str]] = set()
+# NOTE: the flavor-specific `textfile.directory=<dir>` entry is appended at the call
+# sites, because the directory differs between the snap and apt installations.
 NODE_EXPORTER_ENABLED_COLLECTORS: Final[Set[str]] = {
     "drm",
     "logind",
@@ -35,12 +37,12 @@ NODE_EXPORTER_ENABLED_COLLECTORS: Final[Set[str]] = {
     "processes",
     "sysctl",
     "textfile",
-    f"textfile.directory={NODE_EXPORTER_TEXTFILE_DIRECTORY}",
 }
 
 # node-exporter installed from the Ubuntu archive (package-type=apt).
-# The charm does NOT manage this package's configuration; it relies on the
-# deb's stock defaults (listen :9100, textfile dir below per Debian packaging).
+# The deb is configured via its ARGS defaults file so it captures the same
+# collectors and listen port as the snap flavor.
 NODE_EXPORTER_APT_PACKAGE: Final[str] = "prometheus-node-exporter"
 NODE_EXPORTER_APT_SERVICE: Final[str] = "prometheus-node-exporter"
+NODE_EXPORTER_APT_DEFAULTS_PATH: Final[str] = "/etc/default/prometheus-node-exporter"
 NODE_EXPORTER_APT_TEXTFILE_DIRECTORY: Final[str] = "/var/lib/prometheus/node-exporter"

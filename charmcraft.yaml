@@ -420,12 +420,11 @@ config:
         still uses it) and node-exporter is reinstalled from the newly
         selected source.
 
-        With "apt", the deb's stock configuration is used as-is: the charm
-        does not enable extra collectors (systemd, logind, processes, ...)
-        and the node_exporter listen port cannot be overridden via the
-        "ports" option. The deb version depends on the machine's Ubuntu
-        release. With "snap", the charm manages the collector set and
-        listen port, and the snap is pinned to a charm-chosen revision.
+        Both flavors are configured identically by the charm (collector
+        set and listen port): the snap via `snap set`, the deb via
+        /etc/default/prometheus-node-exporter. The difference is the
+        version source: the deb version depends on the machine's Ubuntu
+        release, while the snap is pinned to a charm-chosen revision.
 
 actions:
   reconcile:

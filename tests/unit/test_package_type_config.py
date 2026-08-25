@@ -35,20 +35,11 @@ def test_valid_package_type_values_do_not_block(ctx):
         assert "package-type" not in getattr(state_out.unit_status, "message", "")
 
 
-def test_node_exporter_port_override_blocks_in_apt_mode(ctx):
-    # GIVEN apt mode (default) with a node_exporter port override
-    state = State(config={"ports": "node_exporter=9200"})
-    # WHEN the reconciler runs
-    state_out = ctx.run(ctx.on.config_changed(), state)
-    # THEN the unit is blocked: the charm does not configure the stock deb
-    assert state_out.unit_status.name == "blocked"
-    assert state_out.unit_status.message == "node_exporter port override requires package-type=snap"
-
-
-def test_node_exporter_port_override_allowed_in_snap_mode(ctx):
-    # GIVEN snap mode with a node_exporter port override
-    state = State(config={"package-type": "snap", "ports": "node_exporter=9200"})
-    # WHEN the reconciler runs
-    state_out = ctx.run(ctx.on.config_changed(), state)
-    # THEN the unit is not blocked over the port override
-    assert "port override" not in getattr(state_out.unit_status, "message", "")
+def test_node_exporter_port_override_allowed_in_both_modes(ctx):
+    for package_type in ("snap", "apt"):
+        # GIVEN a node_exporter port override
+        state = State(config={"package-type": package_type, "ports": "node_exporter=9200"})
+        # WHEN the reconciler runs
+        state_out = ctx.run(ctx.on.config_changed(), state)
+        # THEN the unit is not blocked over the port override
+        assert "port override" not in getattr(state_out.unit_status, "message", "")

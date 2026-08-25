@@ -37,7 +37,6 @@ from constants import (
     LOKI_RULES_DEST_PATH,
     METRICS_RULES_DEST_PATH,
     NODE_EXPORTER_APT_PACKAGE,
-    NODE_EXPORTER_APT_SERVICE,
     NODE_EXPORTER_APT_TEXTFILE_DIRECTORY,
     NODE_EXPORTER_DISABLED_COLLECTORS,
     NODE_EXPORTER_ENABLED_COLLECTORS,
@@ -248,15 +247,6 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
             port_map = build_port_map(cast(str, self.config.get("ports")))
         except ValueError as e:
             self.unit.status = BlockedStatus(f"Invalid ports config: {e}")
-            return
-
-        # The stock deb listens on :9100 and the charm does not manage its config,
-        # so a node_exporter port override can only be honored by the snap flavor.
-        if (
-            self._node_exporter_package_type == "apt"
-            and port_map[Port.node_exporter.name] != Port.node_exporter.value
-        ):
-            self.unit.status = BlockedStatus("node_exporter port override requires package-type=snap")
             return
 
         # Create the config manager
@@ -746,8 +736,11 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
 
     def _configure_node_exporter(self, port: int):
         """Configure the node-exporter snap."""
+        collectors = NODE_EXPORTER_ENABLED_COLLECTORS | {
+            f"textfile.directory={NODE_EXPORTER_TEXTFILE_DIRECTORY}"
+        }
         configs = {
-            "collectors": " ".join(sorted(NODE_EXPORTER_ENABLED_COLLECTORS)),
+            "collectors": " ".join(sorted(collectors)),
             "no-collectors": " ".join(sorted(NODE_EXPORTER_DISABLED_COLLECTORS)),
             "web.listen-address": f":{port}",
         }
@@ -783,26 +776,29 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
 
         Uninstalls the other flavor when this unit is its last registered user
         (see SingletonSnapManager) and installs the desired flavor if missing.
-        The apt flavor is intentionally left with the deb's stock configuration;
-        the snap flavor keeps the existing snap-set configuration path.
+        Both flavors are configured with the same collector set and listen port:
+        the snap via `snap set`, the deb via its ARGS defaults file.
         """
         manager = SingletonSnapManager(self.unit.name)
         if self._node_exporter_package_type == "apt":
             # Drop the snap flavor if this unit is its last user
             manager.unregister_all_for_unit("node-exporter")
+            snap_removed = False
             if (
                 not manager.is_used_by_other_units("node-exporter")
                 and self.snap("node-exporter").present
             ):
                 self._remove_snap("node-exporter")
+                snap_removed = True
             if not apt_management.is_installed(NODE_EXPORTER_APT_PACKAGE):
                 self.unit.status = MaintenanceStatus(f"Installing {NODE_EXPORTER_APT_PACKAGE} deb")
                 apt_management.install_package(NODE_EXPORTER_APT_PACKAGE)
             manager.register(NODE_EXPORTER_APT_PACKAGE, 0)
-            # The service may be down if it failed to bind :9100 while the snap
-            # flavor still held the port (e.g. mid-switch across several units).
-            apt_management.ensure_service_running(NODE_EXPORTER_APT_SERVICE)
             self._ensure_directory(self._node_exporter_textfile_dir)
+            # Writes the ARGS defaults file and restarts the service when the config
+            # changed or the service is down (e.g. it failed to bind :9100 while the
+            # snap flavor still held the port mid-switch across several units).
+            apt_management.sync_node_exporter_config(port, force_restart=snap_removed)
             self._node_exporter_info_metric_file_path.write_text(self._info_metric)
         else:
             # Drop the apt flavor if this unit is its last user

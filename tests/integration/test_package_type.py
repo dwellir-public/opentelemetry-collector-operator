@@ -28,6 +28,14 @@ def node_exporter_serving_metrics(juju: jubilant.Juju) -> bool:
     return "node_" in output or "# HELP" in output
 
 
+def node_exporter_has_charm_collectors(juju: jubilant.Juju) -> bool:
+    """True if the running node-exporter process was started with the charm's collector flags."""
+    output = juju.ssh(
+        "otelcol/0", command="ps ax | grep node-exporter | egrep -v 'grep|snapfuse'"
+    )
+    return "collector.drm" in output
+
+
 def settle(juju: jubilant.Juju):
     # otelcol is expected to be blocked on missing mandatory outgoing relations,
     # like in test_principal.py; agents must be idle either way.
@@ -53,14 +61,16 @@ def test_default_package_type_is_apt(juju: jubilant.Juju):
     # THEN the deb is installed and the snap is not
     assert deb_installed(juju)
     assert not snap_installed(juju)
-    # AND node-exporter serves metrics on the stock port with stock config
+    # AND node-exporter serves metrics on the node-exporter port
     assert node_exporter_serving_metrics(juju)
+    # AND the deb runs with the charm's collector flags (from the ARGS defaults file)
+    assert node_exporter_has_charm_collectors(juju)
 
 
 @RETRY
-def test_info_metric_scraped_from_stock_textfile_dir(juju: jubilant.Juju):
+def test_info_metric_scraped_from_textfile_dir(juju: jubilant.Juju):
     # THEN the per-unit info metric written to /var/lib/prometheus/node-exporter is served
-    # (validates the assumption that the stock deb scrapes that directory)
+    # (the charm points the deb's textfile collector at that directory via ARGS)
     output = juju.ssh(
         "otelcol/0",
         command="curl -s http://localhost:9100/metrics | grep otelcol_subordinate_charm_info || true",
@@ -81,6 +91,7 @@ def _assert_snap_flavor(juju: jubilant.Juju):
     assert snap_installed(juju)
     assert not deb_installed(juju)
     assert node_exporter_serving_metrics(juju)
+    assert node_exporter_has_charm_collectors(juju)
 
 
 def test_switch_back_to_apt(juju: jubilant.Juju):
@@ -96,3 +107,4 @@ def _assert_apt_flavor(juju: jubilant.Juju):
     assert deb_installed(juju)
     assert not snap_installed(juju)
     assert node_exporter_serving_metrics(juju)
+    assert node_exporter_has_charm_collectors(juju)

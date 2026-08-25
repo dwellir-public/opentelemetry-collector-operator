@@ -70,10 +70,8 @@ def test_node_metrics(juju: jubilant.Juju):
 
 
 def test_node_exporter_collectors(juju: jubilant.Juju):
-    # The charm-curated collector set only applies to the snap flavor; the default
-    # apt flavor runs the deb with its stock configuration.
-    juju.config("otelcol", {"package-type": "snap"})
-    juju.wait(jubilant.all_agents_idle, error=jubilant.any_error, timeout=420)
+    # The charm applies the same collector set to both package flavors, so this
+    # holds for the default apt flavor as well as for package-type=snap.
     node_exporter_collectors = r"collector.drm"
     is_included = is_node_exporter_running_with_collectors(juju, node_exporter_collectors)
     assert is_included

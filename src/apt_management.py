@@ -5,15 +5,24 @@
 Counterpart of snap_management.py for the apt-installed node-exporter
 (the `prometheus-node-exporter` deb from the Ubuntu archive).
 
-By design this module only installs/removes the package and keeps its service
-running. It never writes the deb's configuration (/etc/default/...): the
-package runs with its stock defaults.
+The deb's systemd unit runs `prometheus-node-exporter $ARGS`, with ARGS read
+from /etc/default/prometheus-node-exporter. This module writes that file so
+the apt flavor captures the same collectors and listen port as the snap.
 """
 
 import logging
 
 import charms.operator_libs_linux.v0.apt as apt
 import charms.operator_libs_linux.v1.systemd as systemd
+from charmlibs.pathops import LocalPath
+
+from constants import (
+    NODE_EXPORTER_APT_DEFAULTS_PATH,
+    NODE_EXPORTER_APT_SERVICE,
+    NODE_EXPORTER_APT_TEXTFILE_DIRECTORY,
+    NODE_EXPORTER_DISABLED_COLLECTORS,
+    NODE_EXPORTER_ENABLED_COLLECTORS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -36,7 +45,7 @@ def is_installed(package_name: str) -> bool:
 
 
 def install_package(package_name: str) -> None:
-    """Install a deb package from the Ubuntu archive with its stock configuration.
+    """Install a deb package from the Ubuntu archive.
 
     Raises:
         AptInstallError: if the package cannot be found or installed.
@@ -65,3 +74,40 @@ def ensure_service_running(service_name: str) -> None:
     """
     if not systemd.service_running(service_name):
         systemd.service_restart(service_name)
+
+
+def build_node_exporter_args(port: int) -> str:
+    """Build the ARGS line for /etc/default/prometheus-node-exporter.
+
+    Each entry of the collector sets maps to `--collector.<entry>` /
+    `--no-collector.<entry>`, matching how the snap translates its
+    `collectors`/`no-collectors` config internally. Flags are sorted so the
+    file only changes when the configuration changes.
+    """
+    collectors = NODE_EXPORTER_ENABLED_COLLECTORS | {
+        f"textfile.directory={NODE_EXPORTER_APT_TEXTFILE_DIRECTORY}"
+    }
+    flags = [f"--collector.{c}" for c in sorted(collectors)]
+    flags += [f"--no-collector.{c}" for c in sorted(NODE_EXPORTER_DISABLED_COLLECTORS)]
+    flags.append(f"--web.listen-address=:{port}")
+    return f'ARGS="{" ".join(flags)}"'
+
+
+def sync_node_exporter_config(
+    port: int,
+    defaults_path: str = NODE_EXPORTER_APT_DEFAULTS_PATH,
+    force_restart: bool = False,
+) -> None:
+    """Write the node-exporter defaults file and (re)start the service as needed.
+
+    The service is restarted when the file content changed, when the service is
+    not running (e.g. it failed to bind while the other package flavor still
+    held the port), or when force_restart is set.
+    """
+    desired = build_node_exporter_args(port) + "\n"
+    path = LocalPath(defaults_path)
+    changed = not path.exists() or path.read_text() != desired
+    if changed:
+        path.write_text(desired)
+    if changed or force_restart or not systemd.service_running(NODE_EXPORTER_APT_SERVICE):
+        systemd.service_restart(NODE_EXPORTER_APT_SERVICE)

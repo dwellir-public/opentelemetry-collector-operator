@@ -186,8 +186,9 @@ def mock_apt_operations():
         patch("apt_management.systemd.service_restart"),
         patch("apt_management.systemd.service_running", return_value=True),
         patch("apt_management.is_installed", return_value=False) as mock_is_installed,
+        patch("apt_management.sync_node_exporter_config") as mock_sync_config,
     ):
-        yield {"is_installed": mock_is_installed}
+        yield {"is_installed": mock_is_installed, "sync_config": mock_sync_config}
 
 
 @pytest.fixture(autouse=True)
