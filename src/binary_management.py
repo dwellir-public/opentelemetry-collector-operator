@@ -25,20 +25,26 @@ import shutil
 import subprocess
 import tempfile
 import urllib.request
+from textwrap import dedent
 from typing import Optional
 from urllib.error import URLError
 from urllib.parse import urlparse
 
+import charms.operator_libs_linux.v1.systemd as systemd
 from charmlibs.pathops import LocalPath
 
 from constants import (
+    NODE_EXPORTER_BINARY_DIR,
     NODE_EXPORTER_BINARY_GROUP,
     NODE_EXPORTER_BINARY_NOLOGIN_SHELL,
     NODE_EXPORTER_BINARY_PATH,
+    NODE_EXPORTER_BINARY_SERVICE,
     NODE_EXPORTER_BINARY_STATE_PATH,
+    NODE_EXPORTER_BINARY_TEXTFILE_DIRECTORY,
+    NODE_EXPORTER_BINARY_UNIT_PATH,
     NODE_EXPORTER_BINARY_USER,
 )
-from node_exporter_flags import Version, parse_version
+from node_exporter_flags import Version, build_collector_flags, parse_version
 
 log = logging.getLogger(__name__)
 
@@ -205,3 +211,123 @@ def binary_version(binary_path: str = NODE_EXPORTER_BINARY_PATH) -> Optional[Ver
         return None
     match = re.search(r"version\s+v?(\d+\.\d+(?:\.\d+)?)", f"{result.stdout}\n{result.stderr}")
     return parse_version(match.group(1)) if match else None
+
+
+def build_unit_file(
+    port: int,
+    binary_path: str = NODE_EXPORTER_BINARY_PATH,
+    user: str = NODE_EXPORTER_BINARY_USER,
+    group: str = NODE_EXPORTER_BINARY_GROUP,
+    textfile_directory: str = NODE_EXPORTER_BINARY_TEXTFILE_DIRECTORY,
+    version: Optional[Version] = None,
+) -> str:
+    """Render the systemd unit that runs the custom node-exporter binary.
+
+    The collector flags come from the same builder the apt flavor uses, so all
+    three package flavors expose the same metrics on the same port.
+
+    The service runs unprivileged, like the Ubuntu archive deb does. Collectors
+    that need root (notably `systemd`, which reads the root-owned
+    /run/systemd/private socket) will log errors instead of producing metrics;
+    that is the same trade-off the apt flavor already makes.
+    """
+    flags = " ".join(build_collector_flags(port, textfile_directory, version))
+    return dedent(f"""\
+        # Managed by the opentelemetry-collector charm. Do not edit.
+        [Unit]
+        Description=Prometheus Node Exporter (custom build, managed by the opentelemetry-collector charm)
+        Documentation=https://github.com/prometheus/node_exporter
+        Wants=network-online.target
+        After=network-online.target
+
+        [Service]
+        Type=simple
+        User={user}
+        Group={group}
+        ExecStart={binary_path} {flags}
+        Restart=always
+        RestartSec=5
+        NoNewPrivileges=true
+        ProtectHome=true
+
+        [Install]
+        WantedBy=multi-user.target
+        """)
+
+
+def sync_node_exporter_service(
+    url: str,
+    port: int,
+    binary_path: str = NODE_EXPORTER_BINARY_PATH,
+    state_path: str = NODE_EXPORTER_BINARY_STATE_PATH,
+    unit_path: str = NODE_EXPORTER_BINARY_UNIT_PATH,
+    service: str = NODE_EXPORTER_BINARY_SERVICE,
+    force_restart: bool = False,
+) -> None:
+    """Converge the custom-binary flavor onto the configured URL and port.
+
+    The binary is re-downloaded only when the configured URL differs from the
+    one recorded in the state file, or when the binary is missing; the unit
+    file is rewritten only when its rendered content changes. The service is
+    restarted when either changed, when it is not running (e.g. it could not
+    bind the port while another flavor still held it mid-switch), or when
+    force_restart is set.
+
+    Raises:
+        BinaryUrlError: if url is not an http(s) URL.
+        BinaryDownloadError: if the binary could not be downloaded.
+        BinaryServiceError: if systemd could not be reloaded or the service
+            could not be enabled or (re)started.
+    """
+    validate_url(url)
+    ensure_user()
+
+    downloaded = False
+    if not is_installed(binary_path) or installed_url(state_path) != url:
+        download_binary(url, binary_path=binary_path, state_path=state_path)
+        downloaded = True
+
+    desired = build_unit_file(port, binary_path=binary_path, version=binary_version(binary_path))
+    unit = LocalPath(unit_path)
+    unit_changed = not unit.exists() or unit.read_text() != desired
+    if unit_changed:
+        unit.write_text(desired)
+
+    if unit_changed or downloaded:
+        try:
+            systemd.daemon_reload()
+        except systemd.SystemdError as e:
+            raise BinaryServiceError("Failed to reload systemd") from e
+
+    if unit_changed or downloaded or force_restart or not systemd.service_running(service):
+        try:
+            systemd.service_enable(service)
+            systemd.service_restart(service)
+        except systemd.SystemdError as e:
+            raise BinaryServiceError(f"Failed to restart {service}") from e
+
+
+def remove(
+    unit_path: str = NODE_EXPORTER_BINARY_UNIT_PATH,
+    service: str = NODE_EXPORTER_BINARY_SERVICE,
+    directory: str = NODE_EXPORTER_BINARY_DIR,
+) -> None:
+    """Stop the service and delete the unit file, binary and install directory.
+
+    Every step is best-effort and logs instead of raising: this runs from the
+    remove hook and from flavor switches, where a failure must not wedge the
+    unit. The `node-exporter` system user is deliberately left behind; it is
+    harmless and may still own files elsewhere.
+    """
+    try:
+        systemd.service_stop(service)
+        systemd.service_disable(service)
+    except systemd.SystemdError as e:
+        log.warning(f"failed to stop the {service} service: {e}")
+    try:
+        LocalPath(unit_path).unlink(missing_ok=True)
+        systemd.daemon_reload()
+    except (OSError, systemd.SystemdError) as e:
+        log.warning(f"failed to remove the {service} unit file: {e}")
+    shutil.rmtree(directory, ignore_errors=True)
+    log.info("the custom node-exporter binary has been removed")

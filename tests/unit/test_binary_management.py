@@ -17,6 +17,8 @@ import binary_management
 # so this file exercises their own logic.
 _real_ensure_user = binary_management.ensure_user
 _real_is_installed = binary_management.is_installed
+_real_sync_node_exporter_service = binary_management.sync_node_exporter_service
+_real_remove = binary_management.remove
 
 
 def _urlopen_returning(payload: bytes):
@@ -267,3 +269,378 @@ def test_binary_version_is_none_when_the_output_has_no_version():
     completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="hello", stderr="")
     with patch.object(binary_management.subprocess, "run", return_value=completed):
         assert binary_management.binary_version("/opt/x/node_exporter") is None
+
+
+# --- systemd unit rendering -------------------------------------------------
+
+
+def test_build_unit_file_runs_the_binary_with_the_charm_collectors():
+    # WHEN rendering the unit for a recent binary
+    unit = binary_management.build_unit_file(
+        9100,
+        binary_path="/opt/prometheus/node-exporter/node_exporter",
+        user="node-exporter",
+        group="node-exporter",
+        textfile_directory="/opt/prometheus/node-exporter/textfile-collector.d",
+        version=(1, 10, 2),
+    )
+    # THEN it is a valid-looking unit with the three sections
+    assert "[Unit]" in unit and "[Service]" in unit and "[Install]" in unit
+    # AND ExecStart runs the binary with the charm's collectors and port
+    assert "ExecStart=/opt/prometheus/node-exporter/node_exporter " in unit
+    assert "--collector.drm" in unit
+    assert "--collector.textfile.directory=/opt/prometheus/node-exporter/textfile-collector.d" in unit
+    assert "--web.listen-address=:9100" in unit
+    # AND it runs unprivileged and restarts on failure
+    assert "User=node-exporter" in unit
+    assert "Group=node-exporter" in unit
+    assert "Restart=always" in unit
+    assert "WantedBy=multi-user.target" in unit
+
+
+def test_build_unit_file_honours_the_port_override():
+    unit = binary_management.build_unit_file(9200, version=(1, 10, 2))
+    assert "--web.listen-address=:9200" in unit
+
+
+def test_build_unit_file_gates_collectors_by_version():
+    # GIVEN a binary built from an old node_exporter base
+    unit = binary_management.build_unit_file(9100, version=(1, 3, 1))
+    # THEN flags it would not recognise are absent
+    assert "--collector.drm" not in unit
+    assert "--collector.systemd" in unit
+
+
+def test_build_unit_file_is_deterministic():
+    assert binary_management.build_unit_file(9100, version=(1, 10, 2)) == (
+        binary_management.build_unit_file(9100, version=(1, 10, 2))
+    )
+
+
+# --- service sync -----------------------------------------------------------
+
+
+def _sync(tmp_path, url="https://example.com/v1", port=9100, force_restart=False, running=True,
+          installed_url=None, binary_exists=False, payload=b"ELF"):
+    """Run sync_node_exporter_service with systemd, useradd and urlopen mocked.
+
+    Returns (restart_mock, unit_path, binary_path, state_path).
+    """
+    binary = tmp_path / "node_exporter"
+    state = tmp_path / "state.json"
+    unit = tmp_path / "node-exporter.service"
+    if binary_exists:
+        binary.write_bytes(b"OLD")
+    if installed_url is not None:
+        state.write_text(json.dumps({"url": installed_url}))
+    with (
+        patch.object(binary_management.systemd, "service_restart") as restart,
+        patch.object(binary_management.systemd, "service_enable"),
+        patch.object(binary_management.systemd, "daemon_reload"),
+        patch.object(binary_management.systemd, "service_running", return_value=running),
+        patch.object(binary_management, "ensure_user"),
+        patch.object(binary_management, "is_installed", _real_is_installed),
+        patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
+        patch.object(binary_management.urllib.request, "urlopen", _urlopen_returning(payload)),
+    ):
+        _real_sync_node_exporter_service(
+            url,
+            port,
+            binary_path=str(binary),
+            state_path=str(state),
+            unit_path=str(unit),
+            service="node-exporter",
+            force_restart=force_restart,
+        )
+    return restart, unit, binary, state
+
+
+def test_sync_downloads_writes_the_unit_and_starts_the_service(tmp_path):
+    # GIVEN nothing installed yet
+    restart, unit, binary, state = _sync(tmp_path)
+    # THEN the binary is fetched, the unit written and the service started
+    assert binary.read_bytes() == b"ELF"
+    assert "ExecStart=" in unit.read_text()
+    assert json.loads(state.read_text())["url"] == "https://example.com/v1"
+    restart.assert_called_once()
+
+
+def test_sync_creates_the_service_user(tmp_path):
+    binary = tmp_path / "node_exporter"
+    with (
+        patch.object(binary_management.systemd, "service_restart"),
+        patch.object(binary_management.systemd, "service_enable"),
+        patch.object(binary_management.systemd, "daemon_reload"),
+        patch.object(binary_management.systemd, "service_running", return_value=True),
+        patch.object(binary_management, "ensure_user") as ensure_user,
+        patch.object(binary_management, "is_installed", _real_is_installed),
+        patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
+        patch.object(binary_management.urllib.request, "urlopen", _urlopen_returning(b"ELF")),
+    ):
+        _real_sync_node_exporter_service(
+            "https://example.com/v1",
+            9100,
+            binary_path=str(binary),
+            state_path=str(tmp_path / "state.json"),
+            unit_path=str(tmp_path / "node-exporter.service"),
+        )
+    ensure_user.assert_called_once()
+
+
+def test_sync_skips_the_download_when_the_url_is_unchanged(tmp_path):
+    # GIVEN the binary already installed from this exact URL
+    binary = tmp_path / "node_exporter"
+    binary.write_bytes(b"OLD")
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"url": "https://example.com/v1"}))
+    unit = tmp_path / "node-exporter.service"
+    unit.write_text(
+        binary_management.build_unit_file(
+            9100, binary_path=str(binary), version=(1, 10, 2)
+        )
+    )
+    with (
+        patch.object(binary_management.systemd, "service_restart") as restart,
+        patch.object(binary_management.systemd, "service_enable"),
+        patch.object(binary_management.systemd, "daemon_reload"),
+        patch.object(binary_management.systemd, "service_running", return_value=True),
+        patch.object(binary_management, "ensure_user"),
+        patch.object(binary_management, "is_installed", _real_is_installed),
+        patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
+        patch.object(binary_management.urllib.request, "urlopen") as urlopen,
+    ):
+        _real_sync_node_exporter_service(
+            "https://example.com/v1",
+            9100,
+            binary_path=str(binary),
+            state_path=str(state),
+            unit_path=str(unit),
+        )
+    # THEN nothing is fetched and the service is left alone
+    urlopen.assert_not_called()
+    restart.assert_not_called()
+    assert binary.read_bytes() == b"OLD"
+
+
+def test_sync_redownloads_when_the_url_changes(tmp_path):
+    # GIVEN a binary installed from a different URL
+    restart, _, binary, state = _sync(
+        tmp_path, url="https://example.com/v2", installed_url="https://example.com/v1",
+        binary_exists=True, payload=b"NEW",
+    )
+    # THEN the new build replaces the old one and the service restarts
+    assert binary.read_bytes() == b"NEW"
+    assert json.loads(state.read_text())["url"] == "https://example.com/v2"
+    restart.assert_called_once()
+
+
+def test_sync_redownloads_when_the_binary_is_missing(tmp_path):
+    # GIVEN the state file claims this URL but the binary is gone
+    restart, _, binary, _ = _sync(
+        tmp_path, installed_url="https://example.com/v1", binary_exists=False
+    )
+    assert binary.exists()
+    restart.assert_called_once()
+
+
+def test_sync_restarts_when_only_the_port_changed(tmp_path):
+    # GIVEN an installed binary and a unit file rendered for port 9100
+    binary = tmp_path / "node_exporter"
+    binary.write_bytes(b"OLD")
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"url": "https://example.com/v1"}))
+    unit = tmp_path / "node-exporter.service"
+    unit.write_text(binary_management.build_unit_file(9100, binary_path=str(binary), version=(1, 10, 2)))
+    with (
+        patch.object(binary_management.systemd, "service_restart") as restart,
+        patch.object(binary_management.systemd, "service_enable"),
+        patch.object(binary_management.systemd, "daemon_reload") as daemon_reload,
+        patch.object(binary_management.systemd, "service_running", return_value=True),
+        patch.object(binary_management, "ensure_user"),
+        patch.object(binary_management, "is_installed", _real_is_installed),
+        patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
+        patch.object(binary_management.urllib.request, "urlopen") as urlopen,
+    ):
+        # WHEN syncing with a different port
+        _real_sync_node_exporter_service(
+            "https://example.com/v1", 9200,
+            binary_path=str(binary), state_path=str(state), unit_path=str(unit),
+        )
+    # THEN nothing is re-downloaded but the unit is rewritten and reloaded
+    urlopen.assert_not_called()
+    assert "--web.listen-address=:9200" in unit.read_text()
+    daemon_reload.assert_called_once()
+    restart.assert_called_once()
+
+
+def test_sync_restarts_when_the_service_is_not_running(tmp_path):
+    # GIVEN everything up to date but the service down
+    binary = tmp_path / "node_exporter"
+    binary.write_bytes(b"OLD")
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"url": "https://example.com/v1"}))
+    unit = tmp_path / "node-exporter.service"
+    unit.write_text(binary_management.build_unit_file(9100, binary_path=str(binary), version=(1, 10, 2)))
+    with (
+        patch.object(binary_management.systemd, "service_restart") as restart,
+        patch.object(binary_management.systemd, "service_enable"),
+        patch.object(binary_management.systemd, "daemon_reload"),
+        patch.object(binary_management.systemd, "service_running", return_value=False),
+        patch.object(binary_management, "ensure_user"),
+        patch.object(binary_management, "is_installed", _real_is_installed),
+        patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
+        patch.object(binary_management.urllib.request, "urlopen") as urlopen,
+    ):
+        _real_sync_node_exporter_service(
+            "https://example.com/v1", 9100,
+            binary_path=str(binary), state_path=str(state), unit_path=str(unit),
+        )
+    urlopen.assert_not_called()
+    restart.assert_called_once()
+
+
+def test_sync_force_restart(tmp_path):
+    """Used right after a competing flavor was uninstalled and freed the port."""
+    binary = tmp_path / "node_exporter"
+    binary.write_bytes(b"OLD")
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"url": "https://example.com/v1"}))
+    unit = tmp_path / "node-exporter.service"
+    unit.write_text(binary_management.build_unit_file(9100, binary_path=str(binary), version=(1, 10, 2)))
+    with (
+        patch.object(binary_management.systemd, "service_restart") as restart,
+        patch.object(binary_management.systemd, "service_enable"),
+        patch.object(binary_management.systemd, "daemon_reload"),
+        patch.object(binary_management.systemd, "service_running", return_value=True),
+        patch.object(binary_management, "ensure_user"),
+        patch.object(binary_management, "is_installed", _real_is_installed),
+        patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
+        patch.object(binary_management.urllib.request, "urlopen"),
+    ):
+        _real_sync_node_exporter_service(
+            "https://example.com/v1", 9100,
+            binary_path=str(binary), state_path=str(state), unit_path=str(unit),
+            force_restart=True,
+        )
+    restart.assert_called_once()
+
+
+def test_sync_raises_binary_service_error_on_restart_failure(tmp_path):
+    binary = tmp_path / "node_exporter"
+    with (
+        patch.object(
+            binary_management.systemd,
+            "service_restart",
+            side_effect=binary_management.systemd.SystemdError("boom"),
+        ),
+        patch.object(binary_management.systemd, "service_enable"),
+        patch.object(binary_management.systemd, "daemon_reload"),
+        patch.object(binary_management.systemd, "service_running", return_value=True),
+        patch.object(binary_management, "ensure_user"),
+        patch.object(binary_management, "is_installed", _real_is_installed),
+        patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
+        patch.object(binary_management.urllib.request, "urlopen", _urlopen_returning(b"ELF")),
+    ):
+        # THEN a typed error is raised for the charm to turn into BlockedStatus
+        with pytest.raises(binary_management.BinaryServiceError):
+            _real_sync_node_exporter_service(
+                "https://example.com/v1", 9100,
+                binary_path=str(binary),
+                state_path=str(tmp_path / "state.json"),
+                unit_path=str(tmp_path / "node-exporter.service"),
+            )
+
+
+def test_sync_propagates_download_failure(tmp_path):
+    with (
+        patch.object(binary_management.systemd, "service_restart"),
+        patch.object(binary_management.systemd, "service_enable"),
+        patch.object(binary_management.systemd, "daemon_reload"),
+        patch.object(binary_management.systemd, "service_running", return_value=True),
+        patch.object(binary_management, "ensure_user"),
+        patch.object(binary_management, "is_installed", _real_is_installed),
+        patch.object(binary_management.urllib.request, "urlopen", side_effect=OSError("404")),
+    ):
+        with pytest.raises(binary_management.BinaryDownloadError):
+            _real_sync_node_exporter_service(
+                "https://example.com/v1", 9100,
+                binary_path=str(tmp_path / "node_exporter"),
+                state_path=str(tmp_path / "state.json"),
+                unit_path=str(tmp_path / "node-exporter.service"),
+            )
+
+
+def test_sync_rejects_a_non_http_url(tmp_path):
+    with pytest.raises(binary_management.BinaryUrlError):
+        _real_sync_node_exporter_service(
+            "file:///etc/passwd", 9100,
+            binary_path=str(tmp_path / "node_exporter"),
+            state_path=str(tmp_path / "state.json"),
+            unit_path=str(tmp_path / "node-exporter.service"),
+        )
+
+
+# --- removal ----------------------------------------------------------------
+
+
+def test_remove_stops_the_service_and_deletes_everything(tmp_path):
+    # GIVEN an installed binary, state file and unit file
+    directory = tmp_path / "node-exporter"
+    directory.mkdir()
+    (directory / "node_exporter").write_bytes(b"ELF")
+    (directory / "state.json").write_text("{}")
+    unit = tmp_path / "node-exporter.service"
+    unit.write_text("[Unit]\n")
+    with (
+        patch.object(binary_management.systemd, "service_stop") as stop,
+        patch.object(binary_management.systemd, "service_disable") as disable,
+        patch.object(binary_management.systemd, "daemon_reload") as daemon_reload,
+    ):
+        # WHEN removing
+        _real_remove(
+            unit_path=str(unit), service="node-exporter", directory=str(directory)
+        )
+    # THEN the service is stopped and disabled, and the files are gone
+    stop.assert_called_once_with("node-exporter")
+    disable.assert_called_once_with("node-exporter")
+    daemon_reload.assert_called_once()
+    assert not unit.exists()
+    assert not directory.exists()
+
+
+def test_remove_is_best_effort_when_systemd_fails(tmp_path):
+    """Removal runs from the remove hook, where raising would wedge the unit."""
+    directory = tmp_path / "node-exporter"
+    directory.mkdir()
+    unit = tmp_path / "node-exporter.service"
+    unit.write_text("[Unit]\n")
+    with (
+        patch.object(
+            binary_management.systemd,
+            "service_stop",
+            side_effect=binary_management.systemd.SystemdError("no such unit"),
+        ),
+        patch.object(binary_management.systemd, "service_disable"),
+        patch.object(binary_management.systemd, "daemon_reload"),
+    ):
+        # THEN no exception propagates
+        _real_remove(
+            unit_path=str(unit), service="node-exporter", directory=str(directory)
+        )
+    # AND the files are still cleaned up
+    assert not unit.exists()
+    assert not directory.exists()
+
+
+def test_remove_tolerates_nothing_being_installed(tmp_path):
+    with (
+        patch.object(binary_management.systemd, "service_stop"),
+        patch.object(binary_management.systemd, "service_disable"),
+        patch.object(binary_management.systemd, "daemon_reload"),
+    ):
+        # THEN no exception propagates for absent paths
+        _real_remove(
+            unit_path=str(tmp_path / "absent.service"),
+            service="node-exporter",
+            directory=str(tmp_path / "absent"),
+        )
