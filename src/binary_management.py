@@ -33,6 +33,7 @@ from charmlibs.pathops import LocalPath
 
 from constants import (
     NODE_EXPORTER_BINARY_GROUP,
+    NODE_EXPORTER_BINARY_NOLOGIN_SHELL,
     NODE_EXPORTER_BINARY_PATH,
     NODE_EXPORTER_BINARY_STATE_PATH,
     NODE_EXPORTER_BINARY_USER,
@@ -123,7 +124,7 @@ def ensure_user(
                 "--system",
                 "--no-create-home",
                 "--shell",
-                "/usr/sbin/nologin",
+                NODE_EXPORTER_BINARY_NOLOGIN_SHELL,
                 group_flag,
                 user,
             ],
@@ -156,9 +157,12 @@ def download_binary(
     """
     validate_url(url)
     destination = LocalPath(binary_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
     log.info(f"downloading the node-exporter binary from {url}")
-    tmp_fd, tmp_name = tempfile.mkstemp(dir=str(destination.parent), prefix=".node_exporter.")
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        tmp_fd, tmp_name = tempfile.mkstemp(dir=str(destination.parent), prefix=".node_exporter.")
+    except OSError as e:
+        raise BinaryDownloadError(f"Failed to prepare {destination.parent} for download") from e
     try:
         with os.fdopen(tmp_fd, "wb") as tmp_file:
             with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
@@ -171,7 +175,13 @@ def download_binary(
         except OSError:
             pass
         raise BinaryDownloadError(f"Failed to download node-exporter from {url}") from e
-    LocalPath(state_path).write_text(json.dumps({"url": url}) + "\n")
+    try:
+        LocalPath(state_path).write_text(json.dumps({"url": url}) + "\n")
+    except OSError as e:
+        raise BinaryDownloadError(
+            f"node-exporter installed from {url} but the install record could not be "
+            f"written to {state_path}"
+        ) from e
     log.info(f"installed the node-exporter binary at {binary_path}")
 
 

@@ -188,6 +188,64 @@ def test_download_binary_keeps_the_old_binary_when_the_fetch_fails(tmp_path):
     assert leftovers == []
 
 
+def test_download_binary_raises_when_the_directory_cannot_be_prepared(tmp_path):
+    binary = tmp_path / "sub" / "node_exporter"
+    state = tmp_path / "sub" / "state.json"
+    # GIVEN the destination directory cannot be created (e.g. permission denied)
+    with patch.object(
+        binary_management.LocalPath, "mkdir", side_effect=OSError("permission denied")
+    ):
+        # THEN a typed error is raised instead of a bare OSError
+        with pytest.raises(binary_management.BinaryDownloadError):
+            binary_management.download_binary(
+                "https://example.com/v1", binary_path=str(binary), state_path=str(state)
+            )
+    # AND nothing was written
+    assert not binary.exists()
+
+
+def test_download_binary_raises_when_a_temp_file_cannot_be_created(tmp_path):
+    binary = tmp_path / "node_exporter"
+    state = tmp_path / "state.json"
+    # GIVEN a working binary already installed
+    binary.write_bytes(b"OLD")
+    state.write_text(json.dumps({"url": "https://example.com/v1"}))
+    # WHEN the temp file for the new download cannot be created (e.g. disk full)
+    with patch.object(
+        binary_management.tempfile, "mkstemp", side_effect=OSError("no space left on device")
+    ):
+        # THEN a typed error is raised instead of a bare OSError
+        with pytest.raises(binary_management.BinaryDownloadError):
+            binary_management.download_binary(
+                "https://example.com/v2", binary_path=str(binary), state_path=str(state)
+            )
+    # AND the old binary and its recorded URL are untouched
+    assert binary.read_bytes() == b"OLD"
+    assert json.loads(state.read_text())["url"] == "https://example.com/v1"
+
+
+def test_download_binary_raises_a_distinct_error_when_the_state_file_cannot_be_written(tmp_path):
+    binary = tmp_path / "node_exporter"
+    state = tmp_path / "state.json"
+    # GIVEN a URL serving the binary but a state file that cannot be written
+    # (e.g. a read-only mount)
+    with (
+        patch.object(binary_management.urllib.request, "urlopen", _urlopen_returning(b"ELF")),
+        patch.object(
+            binary_management.LocalPath,
+            "write_text",
+            side_effect=OSError("read-only file system"),
+        ),
+    ):
+        # THEN a typed error is raised instead of a bare OSError
+        with pytest.raises(binary_management.BinaryDownloadError):
+            binary_management.download_binary(
+                "https://example.com/v1", binary_path=str(binary), state_path=str(state)
+            )
+    # AND the binary was still installed even though the install record was not
+    assert binary.read_bytes() == b"ELF"
+
+
 # --- version ----------------------------------------------------------------
 
 

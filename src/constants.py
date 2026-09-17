@@ -62,6 +62,7 @@ NODE_EXPORTER_BINARY_SERVICE: Final[str] = "node-exporter"
 NODE_EXPORTER_BINARY_UNIT_PATH: Final[str] = "/etc/systemd/system/node-exporter.service"
 NODE_EXPORTER_BINARY_USER: Final[str] = "node-exporter"
 NODE_EXPORTER_BINARY_GROUP: Final[str] = "node-exporter"
+NODE_EXPORTER_BINARY_NOLOGIN_SHELL: Final[str] = "/usr/sbin/nologin"
 # Pseudo-package name, used only for SingletonSnapManager reference counting so
 # the binary flavor is tracked across co-located units like the snap and deb are.
 NODE_EXPORTER_BINARY_PACKAGE: Final[str] = "node-exporter-binary"
