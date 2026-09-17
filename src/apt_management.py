@@ -78,12 +78,19 @@ def install_package(package_name: str) -> None:
 
 
 def remove_package(package_name: str) -> None:
-    """Remove a deb package. Missing packages are ignored."""
+    """Remove a deb package. Missing packages are ignored.
+
+    Raises:
+        AptError: if the removal itself fails (e.g. a held dpkg lock or a
+            dependency problem).
+    """
     try:
         apt.remove_package(package_name)
         log.info(f"{package_name} deb has been removed")
     except apt.PackageNotFoundError:
         log.debug(f"{package_name} deb was not installed; nothing to remove")
+    except apt.PackageError as e:
+        raise AptError(f"Failed to remove {package_name}") from e
 
 
 def build_node_exporter_args(port: int, version: Optional[Tuple[int, int, int]] = None) -> str:

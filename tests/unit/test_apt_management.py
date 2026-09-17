@@ -55,6 +55,19 @@ def test_remove_package_tolerates_missing_package():
         apt_management.remove_package("prometheus-node-exporter")
 
 
+def test_remove_package_raises_apt_error_on_failure():
+    # GIVEN the underlying apt removal fails (e.g. a held dpkg lock)
+    with patch.object(
+        apt_management.apt,
+        "remove_package",
+        side_effect=apt_management.apt.PackageError("boom"),
+    ):
+        # THEN a typed error is raised for the charm to turn into BlockedStatus,
+        # instead of the bare apt.PackageError escaping this module
+        with pytest.raises(apt_management.AptError):
+            apt_management.remove_package("prometheus-node-exporter")
+
+
 def test_parse_version():
     # Deb version strings parse down to the leading x.y.z
     assert apt_management._parse_version("1.3.1-1ubuntu0.22.04.3") == (1, 3, 1)

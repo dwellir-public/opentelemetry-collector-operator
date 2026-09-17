@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from ops.testing import State
 
+import apt_management
 import binary_management
 from constants import NODE_EXPORTER_APT_PACKAGE, NODE_EXPORTER_BINARY_PACKAGE
 from singleton_snap import SingletonSnapManager
@@ -210,3 +211,36 @@ def test_remove_hook_keeps_a_binary_used_by_another_unit(ctx, mock_binary_operat
     # THEN the binary is NOT removed
     mock_binary_operations["remove"].assert_not_called()
     assert SingletonSnapManager.get_units(NODE_EXPORTER_BINARY_PACKAGE) == {"other_0"}
+
+
+def test_switch_to_binary_blocks_when_deb_removal_fails(
+    ctx, mock_apt_operations, mock_binary_operations
+):
+    # GIVEN this unit previously registered the deb, which is installed, but its removal fails
+    # (e.g. a held dpkg lock)
+    SingletonSnapManager("otelcol/0").register(NODE_EXPORTER_APT_PACKAGE, 0)
+    mock_apt_operations["is_installed"].return_value = True
+    with patch("apt_management.remove_package", side_effect=apt_management.AptError("boom")):
+        # WHEN a binary-url is configured
+        state_out = ctx.run(ctx.on.config_changed(), State(config=BINARY))
+    # THEN the hook completes with a blocked status instead of raising, because the deb
+    # still holds the node-exporter port
+    assert state_out.unit_status.name == "blocked"
+    assert NODE_EXPORTER_APT_PACKAGE in state_out.unit_status.message
+
+
+def test_switch_to_snap_blocks_when_deb_removal_fails(
+    ctx, mock_apt_operations, mock_snap_operations
+):
+    # GIVEN this unit previously registered the deb, which is installed, but its removal fails
+    SingletonSnapManager("otelcol/0").register(NODE_EXPORTER_APT_PACKAGE, 0)
+    mock_apt_operations["is_installed"].return_value = True
+    with (
+        patch("apt_management.remove_package", side_effect=apt_management.AptError("boom")),
+        patch("charm.install_snap"),
+    ):
+        # WHEN this unit switches to package-type=snap
+        state_out = ctx.run(ctx.on.config_changed(), State(config={"package-type": "snap"}))
+    # THEN the hook completes with a blocked status instead of raising
+    assert state_out.unit_status.name == "blocked"
+    assert NODE_EXPORTER_APT_PACKAGE in state_out.unit_status.message

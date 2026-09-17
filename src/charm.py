@@ -916,7 +916,11 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
 
     def _sync_node_exporter_snap(self, port: int) -> Optional[str]:
         """Install and configure the node-exporter snap."""
-        deb_removed = self._drop_node_exporter_deb()
+        try:
+            deb_removed = self._drop_node_exporter_deb()
+        except apt_management.AptError as e:
+            logger.error(f"Failed to uninstall {NODE_EXPORTER_APT_PACKAGE}: {e}")
+            return f"Failed to uninstall {NODE_EXPORTER_APT_PACKAGE}; see debug-log"
         other_removed = self._drop_node_exporter_binary() or deb_removed
         if not self.snap("node-exporter").present:
             self.unit.status = MaintenanceStatus("Installing node-exporter snap")
@@ -937,7 +941,12 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
     def _sync_node_exporter_binary(self, port: int) -> Optional[str]:
         """Install and configure the custom node-exporter build from binary-url."""
         snap_removed = self._drop_node_exporter_snap()
-        other_removed = self._drop_node_exporter_deb() or snap_removed
+        try:
+            deb_removed = self._drop_node_exporter_deb()
+        except apt_management.AptError as e:
+            logger.error(f"Failed to uninstall {NODE_EXPORTER_APT_PACKAGE}: {e}")
+            return f"Failed to uninstall {NODE_EXPORTER_APT_PACKAGE}; see debug-log"
+        other_removed = deb_removed or snap_removed
         SingletonSnapManager(self.unit.name).register(NODE_EXPORTER_BINARY_PACKAGE, 0)
         self._ensure_directory(self._node_exporter_textfile_dir)
         self._node_exporter_info_metric_file_path.write_text(self._info_metric)
