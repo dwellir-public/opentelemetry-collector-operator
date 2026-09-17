@@ -192,6 +192,28 @@ def mock_apt_operations():
 
 
 @pytest.fixture(autouse=True)
+def mock_binary_operations():
+    """Mock the custom node-exporter binary lifecycle (binary-url flavor)."""
+    with (
+        patch("binary_management.ensure_user"),
+        patch("binary_management.systemd.service_restart"),
+        patch("binary_management.systemd.service_enable"),
+        patch("binary_management.systemd.service_stop"),
+        patch("binary_management.systemd.service_disable"),
+        patch("binary_management.systemd.daemon_reload"),
+        patch("binary_management.systemd.service_running", return_value=True),
+        patch("binary_management.is_installed", return_value=False) as mock_is_installed,
+        patch("binary_management.sync_node_exporter_service") as mock_sync,
+        patch("binary_management.remove") as mock_remove,
+    ):
+        yield {
+            "is_installed": mock_is_installed,
+            "sync_service": mock_sync,
+            "remove": mock_remove,
+        }
+
+
+@pytest.fixture(autouse=True)
 def mock_singleton_snap_manager():
     """Mock SingletonSnapManager methods."""
     with patch("singleton_snap.SingletonSnapManager.get_revisions", return_value={1, 2}):

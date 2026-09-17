@@ -24,6 +24,7 @@ from ops.model import ActiveStatus, MaintenanceStatus, WaitingStatus
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 import apt_management
+import binary_management
 import integrations
 from config_builder import Component, Port, build_port_map
 from config_manager import ConfigManager
@@ -237,8 +238,19 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
                 )
                 return
 
-        # Validate the node-exporter package-type config
-        if self._node_exporter_package_type not in ("snap", "apt"):
+        # Validate the node-exporter flavor config. A non-empty binary-url takes
+        # precedence over package-type, which is then not validated at all: it is
+        # ignored, so a stale value must not block the unit.
+        if binary_url := self._node_exporter_binary_url:
+            try:
+                binary_management.validate_url(binary_url)
+            except binary_management.BinaryUrlError as e:
+                logger.error(f"Invalid binary-url config: {e}")
+                self.unit.status = BlockedStatus(
+                    "Invalid binary-url config: must be an http(s) URL to a node_exporter executable"
+                )
+                return
+        elif self._node_exporter_package_type not in ("snap", "apt"):
             self.unit.status = BlockedStatus("Invalid package-type config: must be 'snap' or 'apt'")
             return
 
@@ -1017,6 +1029,22 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
     def _node_exporter_package_type(self) -> str:
         """The configured package source for node-exporter ('snap' or 'apt')."""
         return cast(str, self.config.get("package-type"))
+
+    @property
+    def _node_exporter_binary_url(self) -> str:
+        """URL of a custom node-exporter build, or '' when none is configured."""
+        return cast(str, self.config.get("binary-url")).strip()
+
+    @property
+    def _node_exporter_flavor(self) -> str:
+        """Which node-exporter source this unit uses: 'binary', 'snap' or 'apt'.
+
+        A non-empty binary-url wins over package-type, because the upstream snap
+        and deb do not carry our custom collectors.
+        """
+        if self._node_exporter_binary_url:
+            return "binary"
+        return self._node_exporter_package_type
 
     @property
     def _node_exporter_textfile_dir(self) -> str:

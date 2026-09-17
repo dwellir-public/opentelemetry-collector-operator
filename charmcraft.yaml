@@ -426,6 +426,46 @@ config:
         version source: the deb version depends on the machine's Ubuntu
         release, while the snap is pinned to a charm-chosen revision.
 
+        This option is ignored while `binary-url` is set: a custom build takes
+        precedence over both package sources.
+    binary-url:
+      type: string
+      default: ""
+      description: |
+        URL of a prebuilt node_exporter executable to install instead of the
+        snap or the deb. Leave empty (the default) to use `package-type`.
+
+        Use this when you run a custom node_exporter build whose collectors are
+        not in the upstream snap or in the Ubuntu archive package. The URL must
+        be http(s) and must point directly at the executable — not at a tarball,
+        a release page, or a redirect to one.
+
+        When set, this option takes precedence over `package-type`: the snap and
+        the deb are uninstalled (unless another collector unit on the same
+        machine still uses them) and the charm takes over the whole lifecycle:
+
+          * the binary is downloaded to
+            /opt/prometheus/node-exporter/node_exporter
+          * it runs as a dedicated, unprivileged `node-exporter` system user
+            created by the charm
+          * a charm-managed systemd unit, node-exporter.service, starts and
+            stops it and restarts it on failure
+          * the textfile collector reads
+            /opt/prometheus/node-exporter/textfile-collector.d
+
+        The binary is re-downloaded only when this URL changes, so publish each
+        build at its own URL (for example one containing the version or the
+        commit). Re-uploading a new build over the same URL will not be picked
+        up.
+
+        Like the `apt` flavor, the service runs unprivileged, so collectors that
+        need root — notably `systemd` — report errors instead of metrics. The
+        `snap` flavor is the only one that runs as root.
+
+        Example:
+          juju config opentelemetry-collector \
+            binary-url=https://example.com/builds/node_exporter-1.10.2-custom
+
 actions:
   reconcile:
     description: >
