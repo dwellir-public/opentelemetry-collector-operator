@@ -247,6 +247,7 @@ def mock_ensure_directory(request, tmp_path):
         patch("charm.CERT_DIR", "/tmp/test_certs"),
         patch("charm.NODE_EXPORTER_TEXTFILE_DIRECTORY", str(node_exporter_dir)),
         patch("charm.NODE_EXPORTER_APT_TEXTFILE_DIRECTORY", str(node_exporter_dir)),
+        patch("charm.NODE_EXPORTER_BINARY_TEXTFILE_DIRECTORY", str(node_exporter_dir)),
     ):
         yield
 
