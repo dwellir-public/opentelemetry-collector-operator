@@ -79,7 +79,7 @@ def test_publish_a_custom_binary_on_the_machine(juju: jubilant.Juju):
 @RETRY
 def _assert_binary_is_served(juju: jubilant.Juju):
     output = juju.ssh(
-        "otelcol/0", command=f"curl -sf -o /dev/null -w '%{{http_code}}' {BINARY_URL}"
+        "otelcol/0", command=f"curl -sf -o /dev/null -w '%{{http_code}}' {BINARY_URL} || true"
     )
     assert "200" in output
 
