@@ -11,12 +11,12 @@ the apt flavor captures the same collectors and listen port as the snap.
 
 Unlike the snap (pinned to a charm-chosen revision), the deb version depends
 on the machine's Ubuntu release (e.g. 1.3.1 on jammy, 1.7.0 on noble), so
-collector flags that the installed version does not know are filtered out —
-node_exporter exits on unknown flags, which would leave the service down.
+collector flags that the installed version does not know are filtered out by
+node_exporter_flags — node_exporter exits on unknown flags, which would leave
+the service down.
 """
 
 import logging
-import re
 from typing import Optional, Tuple
 
 import charms.operator_libs_linux.v0.apt as apt
@@ -28,19 +28,11 @@ from constants import (
     NODE_EXPORTER_APT_PACKAGE,
     NODE_EXPORTER_APT_SERVICE,
     NODE_EXPORTER_APT_TEXTFILE_DIRECTORY,
-    NODE_EXPORTER_DISABLED_COLLECTORS,
-    NODE_EXPORTER_ENABLED_COLLECTORS,
 )
+from node_exporter_flags import build_collector_flags
+from node_exporter_flags import parse_version as _parse_version
 
 log = logging.getLogger(__name__)
-
-# node_exporter version that introduced each charm-enabled collector, for the
-# collectors newer than the oldest deb on a supported base (jammy ships 1.3.1).
-# Ref: https://github.com/prometheus/node_exporter/blob/master/CHANGELOG.md
-NODE_EXPORTER_COLLECTOR_MIN_VERSIONS = {
-    "drm": (1, 4, 0),
-    "sysctl": (1, 5, 0),
-}
 
 
 class AptError(Exception):
@@ -72,16 +64,6 @@ def installed_version(package_name: str) -> Optional[str]:
         return None
 
 
-def _parse_version(raw: Optional[str]) -> Optional[Tuple[int, int, int]]:
-    """Parse the leading x.y.z out of a deb version string."""
-    if not raw:
-        return None
-    match = re.match(r"(\d+)\.(\d+)(?:\.(\d+))?", raw)
-    if not match:
-        return None
-    return (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0))
-
-
 def install_package(package_name: str) -> None:
     """Install a deb package from the Ubuntu archive.
 
@@ -107,24 +89,11 @@ def remove_package(package_name: str) -> None:
 def build_node_exporter_args(port: int, version: Optional[Tuple[int, int, int]] = None) -> str:
     """Build the ARGS line for /etc/default/prometheus-node-exporter.
 
-    Each entry of the collector sets maps to `--collector.<entry>` /
-    `--no-collector.<entry>`, matching how the snap translates its
-    `collectors`/`no-collectors` config internally. Flags are sorted so the
-    file only changes when the configuration changes.
-
-    Collectors that the installed node_exporter version does not know are
-    dropped (also when the version is unknown), because unknown flags make
-    the daemon exit at startup.
+    The deb's systemd unit runs `prometheus-node-exporter $ARGS`. The flags
+    themselves are built by node_exporter_flags, shared with the custom-binary
+    flavor, so both stay configured identically.
     """
-    collectors = set()
-    for collector in NODE_EXPORTER_ENABLED_COLLECTORS:
-        minimum = NODE_EXPORTER_COLLECTOR_MIN_VERSIONS.get(collector)
-        if minimum is None or (version is not None and version >= minimum):
-            collectors.add(collector)
-    collectors.add(f"textfile.directory={NODE_EXPORTER_APT_TEXTFILE_DIRECTORY}")
-    flags = [f"--collector.{c}" for c in sorted(collectors)]
-    flags += [f"--no-collector.{c}" for c in sorted(NODE_EXPORTER_DISABLED_COLLECTORS)]
-    flags.append(f"--web.listen-address=:{port}")
+    flags = build_collector_flags(port, NODE_EXPORTER_APT_TEXTFILE_DIRECTORY, version)
     return f'ARGS="{" ".join(flags)}"'
 
 
