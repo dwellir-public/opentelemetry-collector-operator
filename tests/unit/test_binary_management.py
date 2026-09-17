@@ -607,6 +607,39 @@ def test_sync_raises_binary_service_error_when_restart_raises_oserror(tmp_path):
             )
 
 
+def test_sync_raises_binary_service_error_when_unit_file_write_fails(tmp_path):
+    """A read-only /etc, ENOSPC, etc. writing the unit file must not raise a bare OSError."""
+    binary = tmp_path / "node_exporter"
+    state = tmp_path / "state.json"
+    # GIVEN the binary is already installed from the configured URL, so only the
+    # (missing) unit file needs writing, isolating the failure from the download.
+    binary.write_bytes(b"OLD")
+    state.write_text(json.dumps({"url": "https://example.com/v1"}))
+    with (
+        patch.object(binary_management.systemd, "service_restart"),
+        patch.object(binary_management.systemd, "service_enable"),
+        patch.object(binary_management.systemd, "daemon_reload"),
+        patch.object(binary_management.systemd, "service_running", return_value=True),
+        patch.object(binary_management, "ensure_user"),
+        patch.object(binary_management, "is_installed", _real_is_installed),
+        patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
+        patch.object(binary_management.urllib.request, "urlopen", _urlopen_returning(b"ELF")),
+        patch.object(
+            binary_management.LocalPath,
+            "write_text",
+            side_effect=OSError("read-only file system"),
+        ),
+    ):
+        # THEN a typed error is raised, not the bare OSError
+        with pytest.raises(binary_management.BinaryServiceError):
+            _real_sync_node_exporter_service(
+                "https://example.com/v1", 9100,
+                binary_path=str(binary),
+                state_path=str(state),
+                unit_path=str(tmp_path / "node-exporter.service"),
+            )
+
+
 def test_sync_restarts_when_service_running_raises_oserror(tmp_path):
     """When the running-state cannot be determined, the safe direction is to restart."""
     binary = tmp_path / "node_exporter"

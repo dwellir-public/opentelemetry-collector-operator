@@ -166,6 +166,10 @@ def download_binary(
     log.info(f"downloading the node-exporter binary from {url}")
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
+        # mkdir's mode is subject to the ambient umask; chmod explicitly so the
+        # unprivileged node-exporter service user can traverse to its own binary
+        # even under a stricter-than-022 umask.
+        os.chmod(destination.parent, 0o755)
         tmp_fd, tmp_name = tempfile.mkstemp(dir=str(destination.parent), prefix=".node_exporter.")
     except OSError as e:
         raise BinaryDownloadError(f"Failed to prepare {destination.parent} for download") from e
@@ -289,9 +293,12 @@ def sync_node_exporter_service(
 
     desired = build_unit_file(port, binary_path=binary_path, version=binary_version(binary_path))
     unit = LocalPath(unit_path)
-    unit_changed = not unit.exists() or unit.read_text() != desired
-    if unit_changed:
-        unit.write_text(desired)
+    try:
+        unit_changed = not unit.exists() or unit.read_text() != desired
+        if unit_changed:
+            unit.write_text(desired)
+    except OSError as e:
+        raise BinaryServiceError(f"Failed to write {unit_path}") from e
 
     if unit_changed or downloaded:
         try:

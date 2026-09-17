@@ -3,6 +3,8 @@
 
 """Feature: node-exporter package-type config option."""
 
+from unittest.mock import patch
+
 from ops.testing import State
 
 
@@ -33,6 +35,15 @@ def test_valid_package_type_values_do_not_block(ctx):
         state_out = ctx.run(ctx.on.config_changed(), state)
         # THEN the unit is not blocked over package-type
         assert "package-type" not in getattr(state_out.unit_status, "message", "")
+
+
+def test_install_hook_does_not_crash_on_invalid_package_type(ctx):
+    """The install hook registers packages before package-type is validated."""
+    # GIVEN an invalid package-type value
+    # WHEN the install hook runs, which registers packages before validation
+    with patch("charm.event", return_value="install"), patch("charm.install_snap"):
+        ctx.run(ctx.on.install(), State(config={"package-type": "flatpak"}))
+    # THEN the hook completes instead of raising KeyError
 
 
 def test_node_exporter_port_override_allowed_in_both_modes(ctx):

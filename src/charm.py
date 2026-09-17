@@ -678,8 +678,11 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
         if self._node_exporter_flavor != "snap":
             # Neither the deb nor the custom binary has a pinned revision; register
             # with a constant 0 so the lockfile-based reference counting works the
-            # same way as it does for snaps.
-            manager.register(NODE_EXPORTER_FLAVOR_PACKAGES[self._node_exporter_flavor], 0)
+            # same way as it does for snaps. This runs before _reconcile validates
+            # package-type, so an unrecognised flavor must register nothing rather
+            # than raise KeyError; validation then blocks with a friendly message.
+            if package := NODE_EXPORTER_FLAVOR_PACKAGES.get(self._node_exporter_flavor):
+                manager.register(package, 0)
 
         for snap_name in self._managed_snaps():
             snap_revision = SnapMap.get_revision(snap_name)
@@ -921,6 +924,7 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
         except apt_management.AptError as e:
             logger.error(f"Failed to uninstall {NODE_EXPORTER_APT_PACKAGE}: {e}")
             return f"Failed to uninstall {NODE_EXPORTER_APT_PACKAGE}; see debug-log"
+        # NOTE: both drops must run, so evaluate them before the `or`.
         other_removed = self._drop_node_exporter_binary() or deb_removed
         if not self.snap("node-exporter").present:
             self.unit.status = MaintenanceStatus("Installing node-exporter snap")

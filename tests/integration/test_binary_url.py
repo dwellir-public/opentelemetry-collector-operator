@@ -137,6 +137,7 @@ def test_invalid_binary_url_blocks(juju: jubilant.Juju):
     # Restore a working URL for the next test
     juju.config("otelcol", {"binary-url": BINARY_URL})
     settle(juju)
+    _assert_binary_flavor(juju)
 
 
 @RETRY

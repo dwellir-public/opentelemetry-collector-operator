@@ -161,8 +161,8 @@ def test_no_conflict_when_all_units_use_the_binary(ctx, mock_binary_operations):
     SingletonSnapManager("other/0").register(NODE_EXPORTER_BINARY_PACKAGE, 0)
     # WHEN the reconciler runs
     state_out = ctx.run(ctx.on.config_changed(), State(config=BINARY))
-    # THEN the unit is not blocked over a flavor conflict
-    assert "different node-exporter flavor" not in getattr(state_out.unit_status, "message", "")
+    # THEN the unit reconciles to active, not blocked over a flavor conflict
+    assert state_out.unit_status.name == "active"
 
 
 def test_download_failure_blocks_instead_of_crashing(ctx, mock_binary_operations):

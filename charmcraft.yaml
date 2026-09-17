@@ -437,8 +437,8 @@ config:
 
         Use this when you run a custom node_exporter build whose collectors are
         not in the upstream snap or in the Ubuntu archive package. The URL must
-        be http(s) and must point directly at the executable — not at a tarball,
-        a release page, or a redirect to one.
+        be http(s) and must point directly at the executable — not at a tarball
+        or a release page.
 
         When set, this option takes precedence over `package-type`: the snap and
         the deb are uninstalled (unless another collector unit on the same
