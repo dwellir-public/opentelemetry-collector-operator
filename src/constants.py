@@ -46,3 +46,22 @@ NODE_EXPORTER_APT_PACKAGE: Final[str] = "prometheus-node-exporter"
 NODE_EXPORTER_APT_SERVICE: Final[str] = "prometheus-node-exporter"
 NODE_EXPORTER_APT_DEFAULTS_PATH: Final[str] = "/etc/default/prometheus-node-exporter"
 NODE_EXPORTER_APT_TEXTFILE_DIRECTORY: Final[str] = "/var/lib/prometheus/node-exporter"
+
+# node-exporter built in-house and installed from a URL (binary-url config).
+# Takes precedence over package-type when set. Unlike the snap and the deb
+# there is no packaging, so the charm owns the user, the service and the paths.
+NODE_EXPORTER_BINARY_DIR: Final[str] = "/opt/prometheus/node-exporter"
+NODE_EXPORTER_BINARY_PATH: Final[str] = "/opt/prometheus/node-exporter/node_exporter"
+# Records the URL the installed binary came from, so it is re-downloaded only
+# when the binary-url config changes.
+NODE_EXPORTER_BINARY_STATE_PATH: Final[str] = "/opt/prometheus/node-exporter/.install-state.json"
+NODE_EXPORTER_BINARY_TEXTFILE_DIRECTORY: Final[str] = (
+    "/opt/prometheus/node-exporter/textfile-collector.d"
+)
+NODE_EXPORTER_BINARY_SERVICE: Final[str] = "node-exporter"
+NODE_EXPORTER_BINARY_UNIT_PATH: Final[str] = "/etc/systemd/system/node-exporter.service"
+NODE_EXPORTER_BINARY_USER: Final[str] = "node-exporter"
+NODE_EXPORTER_BINARY_GROUP: Final[str] = "node-exporter"
+# Pseudo-package name, used only for SingletonSnapManager reference counting so
+# the binary flavor is tracked across co-located units like the snap and deb are.
+NODE_EXPORTER_BINARY_PACKAGE: Final[str] = "node-exporter-binary"
