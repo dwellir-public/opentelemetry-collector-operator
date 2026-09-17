@@ -296,15 +296,30 @@ def sync_node_exporter_service(
     if unit_changed or downloaded:
         try:
             systemd.daemon_reload()
-        except systemd.SystemdError as e:
+        except (OSError, systemd.SystemdError) as e:
             raise BinaryServiceError("Failed to reload systemd") from e
 
-    if unit_changed or downloaded or force_restart or not systemd.service_running(service):
+    if unit_changed or downloaded or force_restart or not _service_is_running(service):
         try:
             systemd.service_enable(service)
             systemd.service_restart(service)
-        except systemd.SystemdError as e:
+        except (OSError, systemd.SystemdError) as e:
             raise BinaryServiceError(f"Failed to restart {service}") from e
+
+
+def _service_is_running(service: str) -> bool:
+    """Return whether service is active, treating an un-queryable service as not running.
+
+    `systemd.service_running` can raise a bare OSError (e.g. systemctl is not on PATH),
+    which is not caught by the systemd library itself. When the state cannot be
+    determined, the safe direction is to fall through to the (already-guarded) restart
+    path rather than assume the service is fine.
+    """
+    try:
+        return systemd.service_running(service)
+    except (OSError, systemd.SystemdError) as e:
+        log.warning(f"could not determine whether {service} is running: {e}")
+        return False
 
 
 def remove(
@@ -322,7 +337,7 @@ def remove(
     try:
         systemd.service_stop(service)
         systemd.service_disable(service)
-    except systemd.SystemdError as e:
+    except (OSError, systemd.SystemdError) as e:
         log.warning(f"failed to stop the {service} service: {e}")
     try:
         LocalPath(unit_path).unlink(missing_ok=True)

@@ -551,6 +551,94 @@ def test_sync_raises_binary_service_error_on_restart_failure(tmp_path):
             )
 
 
+def test_sync_raises_binary_service_error_when_daemon_reload_raises_oserror(tmp_path):
+    """systemd._systemctl only converts CalledProcessError; a bare OSError (e.g.
+
+    systemctl missing from PATH) must still surface as BinaryServiceError, not OSError.
+    """
+    binary = tmp_path / "node_exporter"
+    with (
+        patch.object(
+            binary_management.systemd,
+            "daemon_reload",
+            side_effect=OSError("systemctl not found"),
+        ),
+        patch.object(binary_management.systemd, "service_enable"),
+        patch.object(binary_management.systemd, "service_restart"),
+        patch.object(binary_management.systemd, "service_running", return_value=True),
+        patch.object(binary_management, "ensure_user"),
+        patch.object(binary_management, "is_installed", _real_is_installed),
+        patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
+        patch.object(binary_management.urllib.request, "urlopen", _urlopen_returning(b"ELF")),
+    ):
+        # THEN a typed error is raised, not the bare OSError
+        with pytest.raises(binary_management.BinaryServiceError):
+            _real_sync_node_exporter_service(
+                "https://example.com/v1", 9100,
+                binary_path=str(binary),
+                state_path=str(tmp_path / "state.json"),
+                unit_path=str(tmp_path / "node-exporter.service"),
+            )
+
+
+def test_sync_raises_binary_service_error_when_restart_raises_oserror(tmp_path):
+    binary = tmp_path / "node_exporter"
+    with (
+        patch.object(
+            binary_management.systemd,
+            "service_restart",
+            side_effect=OSError("systemctl not found"),
+        ),
+        patch.object(binary_management.systemd, "service_enable"),
+        patch.object(binary_management.systemd, "daemon_reload"),
+        patch.object(binary_management.systemd, "service_running", return_value=True),
+        patch.object(binary_management, "ensure_user"),
+        patch.object(binary_management, "is_installed", _real_is_installed),
+        patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
+        patch.object(binary_management.urllib.request, "urlopen", _urlopen_returning(b"ELF")),
+    ):
+        # THEN a typed error is raised, not the bare OSError
+        with pytest.raises(binary_management.BinaryServiceError):
+            _real_sync_node_exporter_service(
+                "https://example.com/v1", 9100,
+                binary_path=str(binary),
+                state_path=str(tmp_path / "state.json"),
+                unit_path=str(tmp_path / "node-exporter.service"),
+            )
+
+
+def test_sync_restarts_when_service_running_raises_oserror(tmp_path):
+    """When the running-state cannot be determined, the safe direction is to restart."""
+    binary = tmp_path / "node_exporter"
+    binary.write_bytes(b"OLD")
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"url": "https://example.com/v1"}))
+    unit = tmp_path / "node-exporter.service"
+    unit.write_text(binary_management.build_unit_file(9100, binary_path=str(binary), version=(1, 10, 2)))
+    with (
+        patch.object(binary_management.systemd, "service_restart") as restart,
+        patch.object(binary_management.systemd, "service_enable"),
+        patch.object(binary_management.systemd, "daemon_reload"),
+        patch.object(
+            binary_management.systemd,
+            "service_running",
+            side_effect=OSError("systemctl not found"),
+        ),
+        patch.object(binary_management, "ensure_user"),
+        patch.object(binary_management, "is_installed", _real_is_installed),
+        patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
+        patch.object(binary_management.urllib.request, "urlopen") as urlopen,
+    ):
+        # WHEN everything else is unchanged but the running-state check itself fails
+        _real_sync_node_exporter_service(
+            "https://example.com/v1", 9100,
+            binary_path=str(binary), state_path=str(state), unit_path=str(unit),
+        )
+    # THEN nothing is re-downloaded but the service is restarted rather than left alone
+    urlopen.assert_not_called()
+    restart.assert_called_once()
+
+
 def test_sync_propagates_download_failure(tmp_path):
     with (
         patch.object(binary_management.systemd, "service_restart"),
@@ -619,6 +707,34 @@ def test_remove_is_best_effort_when_systemd_fails(tmp_path):
             binary_management.systemd,
             "service_stop",
             side_effect=binary_management.systemd.SystemdError("no such unit"),
+        ),
+        patch.object(binary_management.systemd, "service_disable"),
+        patch.object(binary_management.systemd, "daemon_reload"),
+    ):
+        # THEN no exception propagates
+        _real_remove(
+            unit_path=str(unit), service="node-exporter", directory=str(directory)
+        )
+    # AND the files are still cleaned up
+    assert not unit.exists()
+    assert not directory.exists()
+
+
+def test_remove_is_best_effort_when_service_stop_raises_oserror(tmp_path):
+    """systemd._systemctl only converts CalledProcessError; a bare OSError (e.g.
+
+    systemctl missing from PATH) from service_stop must not escape remove() either.
+    """
+    directory = tmp_path / "node-exporter"
+    directory.mkdir()
+    (directory / "node_exporter").write_bytes(b"ELF")
+    unit = tmp_path / "node-exporter.service"
+    unit.write_text("[Unit]\n")
+    with (
+        patch.object(
+            binary_management.systemd,
+            "service_stop",
+            side_effect=OSError("systemctl not found"),
         ),
         patch.object(binary_management.systemd, "service_disable"),
         patch.object(binary_management.systemd, "daemon_reload"),
