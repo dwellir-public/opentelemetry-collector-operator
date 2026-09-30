@@ -163,10 +163,54 @@ def mock_snap_operations():
     mock_snap.start.return_value = None
     mock_snap.stop.return_value = None
     mock_snap.restart.return_value = None
+    mock_snap.present = False
 
-    # Mock the snap.Snap class to return our mock instance
-    with patch("charm.snap.Snap", return_value=mock_snap):
-        yield
+    # Create a mock for SnapCache that returns the mock snap
+    mock_cache = MagicMock()
+    mock_cache.__getitem__ = MagicMock(return_value=mock_snap)
+
+    # Mock both snap.Snap and snap.SnapCache to return our mock instance
+    with (
+        patch("charm.snap.Snap", return_value=mock_snap),
+        patch("charm.snap.SnapCache", return_value=mock_cache),
+    ):
+        yield mock_snap
+
+
+@pytest.fixture(autouse=True)
+def mock_apt_operations():
+    """Mock apt package operations and the node-exporter systemd service."""
+    with (
+        patch("apt_management.apt.add_package"),
+        patch("apt_management.apt.remove_package"),
+        patch("apt_management.systemd.service_restart"),
+        patch("apt_management.systemd.service_running", return_value=True),
+        patch("apt_management.is_installed", return_value=False) as mock_is_installed,
+        patch("apt_management.sync_node_exporter_config") as mock_sync_config,
+    ):
+        yield {"is_installed": mock_is_installed, "sync_config": mock_sync_config}
+
+
+@pytest.fixture(autouse=True)
+def mock_binary_operations():
+    """Mock the custom node-exporter binary lifecycle (binary-url flavor)."""
+    with (
+        patch("binary_management.ensure_user"),
+        patch("binary_management.systemd.service_restart"),
+        patch("binary_management.systemd.service_enable"),
+        patch("binary_management.systemd.service_stop"),
+        patch("binary_management.systemd.service_disable"),
+        patch("binary_management.systemd.daemon_reload"),
+        patch("binary_management.systemd.service_running", return_value=True),
+        patch("binary_management.is_installed", return_value=False) as mock_is_installed,
+        patch("binary_management.sync_node_exporter_service") as mock_sync,
+        patch("binary_management.remove") as mock_remove,
+    ):
+        yield {
+            "is_installed": mock_is_installed,
+            "sync_service": mock_sync,
+            "remove": mock_remove,
+        }
 
 
 @pytest.fixture(autouse=True)
@@ -202,6 +246,8 @@ def mock_ensure_directory(request, tmp_path):
         patch("charm.OpenTelemetryCollectorCharm._ensure_directory"),
         patch("charm.CERT_DIR", "/tmp/test_certs"),
         patch("charm.NODE_EXPORTER_TEXTFILE_DIRECTORY", str(node_exporter_dir)),
+        patch("charm.NODE_EXPORTER_APT_TEXTFILE_DIRECTORY", str(node_exporter_dir)),
+        patch("charm.NODE_EXPORTER_BINARY_TEXTFILE_DIRECTORY", str(node_exporter_dir)),
     ):
         yield
 
