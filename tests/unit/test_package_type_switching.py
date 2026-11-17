@@ -5,9 +5,12 @@
 
 from unittest.mock import patch
 
+import pytest
+from charms.operator_libs_linux.v2 import snap
 from ops.testing import State
 
 import apt_management
+import snap_management
 from constants import NODE_EXPORTER_APT_PACKAGE
 from singleton_snap import SingletonSnapManager
 
@@ -288,3 +291,38 @@ def test_switch_to_snap_with_no_registrations_does_not_block_on_mismatch(
     # AND the snap actually gets installed and registered in the same reconcile
     assert "node-exporter" in {call.args[0] for call in mock_install.call_args_list}
     assert SingletonSnapManager.get_units("node-exporter") == {"otelcol_0"}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        snap_management.SnapInstallError("boom"),
+        snap_management.SnapSpecError("no revision for this arch"),
+        snap.SnapError("snapd is not ready"),
+    ],
+)
+def test_snap_install_failure_blocks_instead_of_crashing(ctx, error):
+    # GIVEN the node-exporter snap is not installed and cannot be installed
+    with patch("charm.install_snap", side_effect=error):
+        # WHEN the reconciler runs with package-type=snap
+        state_out = ctx.run(ctx.on.config_changed(), State(config={"package-type": "snap"}))
+    # THEN the hook completes with a blocked status instead of raising
+    assert state_out.unit_status.name == "blocked"
+    assert "node-exporter snap" in state_out.unit_status.message
+
+
+def test_snap_start_failure_blocks_instead_of_crashing(ctx, mock_snap_operations):
+    # GIVEN the node-exporter snap installs but its service does not start. Every snap
+    # shares one mock, so fail only the enabling start that follows the install and not
+    # the plain start() of the opentelemetry-collector snap.
+    def start(*args, enable=False, **kwargs):
+        if enable:
+            raise snap.SnapError("boom")
+
+    mock_snap_operations.start.side_effect = start
+    with patch("charm.install_snap"):
+        # WHEN the reconciler runs with package-type=snap
+        state_out = ctx.run(ctx.on.config_changed(), State(config={"package-type": "snap"}))
+    # THEN the hook completes with a blocked status instead of raising
+    assert state_out.unit_status.name == "blocked"
+    assert "node-exporter snap" in state_out.unit_status.message

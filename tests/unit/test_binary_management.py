@@ -3,14 +3,20 @@
 
 """Feature: node-exporter installed from a custom-built binary (binary-url)."""
 
+import http.client
+import http.server
 import io
 import json
 import subprocess
+import threading
+import urllib.request
 from unittest.mock import MagicMock, patch
+from urllib.error import URLError
 
 import pytest
 
 import binary_management
+from constants import NODE_EXPORTER_BINARY_GROUP, NODE_EXPORTER_BINARY_USER
 
 # The autouse mock_binary_operations fixture (conftest.py, added in Task 4) patches
 # these attributes for charm-level tests; capture the real functions at import time
@@ -135,7 +141,7 @@ def test_download_binary_writes_an_executable_and_records_the_url(tmp_path):
     binary = tmp_path / "node_exporter"
     state = tmp_path / "state.json"
     # GIVEN a URL serving the binary
-    with patch.object(binary_management.urllib.request, "urlopen", _urlopen_returning(b"ELFDATA")):
+    with patch.object(binary_management._OPENER, "open", _urlopen_returning(b"ELFDATA")):
         # WHEN downloading
         binary_management.download_binary(
             "https://example.com/v1", binary_path=str(binary), state_path=str(state)
@@ -150,7 +156,7 @@ def test_download_binary_writes_an_executable_and_records_the_url(tmp_path):
 def test_download_binary_creates_the_install_directory(tmp_path):
     binary = tmp_path / "opt" / "prometheus" / "node-exporter" / "node_exporter"
     state = binary.parent / "state.json"
-    with patch.object(binary_management.urllib.request, "urlopen", _urlopen_returning(b"ELF")):
+    with patch.object(binary_management._OPENER, "open", _urlopen_returning(b"ELF")):
         binary_management.download_binary(
             "https://example.com/v1", binary_path=str(binary), state_path=str(state)
         )
@@ -174,7 +180,7 @@ def test_download_binary_keeps_the_old_binary_when_the_fetch_fails(tmp_path):
     state.write_text(json.dumps({"url": "https://example.com/v1"}))
     # WHEN the new download fails mid-flight
     with patch.object(
-        binary_management.urllib.request, "urlopen", side_effect=OSError("connection reset")
+        binary_management._OPENER, "open", side_effect=OSError("connection reset")
     ):
         with pytest.raises(binary_management.BinaryDownloadError):
             binary_management.download_binary(
@@ -232,7 +238,7 @@ def test_download_binary_raises_a_distinct_error_when_the_state_file_cannot_be_w
     # GIVEN a URL serving the binary but a state file that cannot be written
     # (e.g. a read-only mount)
     with (
-        patch.object(binary_management.urllib.request, "urlopen", _urlopen_returning(b"ELF")),
+        patch.object(binary_management._OPENER, "open", _urlopen_returning(b"ELF")),
         patch.object(
             binary_management.LocalPath,
             "write_text",
@@ -246,6 +252,76 @@ def test_download_binary_raises_a_distinct_error_when_the_state_file_cannot_be_w
             )
     # AND the binary was still installed even though the install record was not
     assert binary.read_bytes() == b"ELF"
+
+
+# --- redirects --------------------------------------------------------------
+
+
+def _redirect(from_url: str, to_url: str):
+    """Ask the download redirect handler whether from_url may redirect to to_url."""
+    return binary_management._SafeRedirectHandler().redirect_request(
+        urllib.request.Request(from_url), io.BytesIO(), 302, "Found", http.client.HTTPMessage(), to_url
+    )
+
+
+@pytest.mark.parametrize(
+    "from_url, to_url",
+    [
+        ("https://example.com/node_exporter", "https://cdn.example.com/node_exporter"),
+        ("http://example.com/node_exporter", "https://example.com/node_exporter"),
+        ("http://example.com/node_exporter", "http://mirror.example.com/node_exporter"),
+    ],
+)
+def test_download_follows_redirects_that_keep_the_transport_as_safe(from_url, to_url):
+    request = _redirect(from_url, to_url)
+    assert request is not None
+    assert request.full_url == to_url
+
+
+@pytest.mark.parametrize(
+    "from_url, to_url",
+    [
+        # an https URL must not be downgraded to an unauthenticated transport
+        ("https://example.com/node_exporter", "http://example.com/node_exporter"),
+        # urllib's default handler would follow these to ftp
+        ("https://example.com/node_exporter", "ftp://example.com/node_exporter"),
+        ("http://example.com/node_exporter", "ftp://example.com/node_exporter"),
+    ],
+)
+def test_download_refuses_redirects_that_downgrade_or_leave_http(from_url, to_url):
+    with pytest.raises(URLError, match="refusing redirect"):
+        _redirect(from_url, to_url)
+
+
+def test_download_binary_refuses_a_redirect_to_a_non_http_scheme(tmp_path):
+    # GIVEN a server that redirects the binary URL to an ftp:// location
+    class RedirectToFtp(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(302)
+            self.send_header("Location", "ftp://127.0.0.1/node_exporter")
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), RedirectToFtp)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    binary = tmp_path / "node_exporter"
+    try:
+        # WHEN the binary is downloaded from it
+        with pytest.raises(binary_management.BinaryDownloadError) as excinfo:
+            binary_management.download_binary(
+                f"http://127.0.0.1:{server.server_address[1]}/node_exporter",
+                binary_path=str(binary),
+                state_path=str(tmp_path / "state.json"),
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+    # THEN the redirect is refused rather than followed
+    assert "refusing redirect" in str(excinfo.value.__cause__)
+    # AND nothing is installed
+    assert not binary.exists()
 
 
 # --- version ----------------------------------------------------------------
@@ -269,6 +345,29 @@ def test_binary_version_is_none_when_the_output_has_no_version():
     completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="hello", stderr="")
     with patch.object(binary_management.subprocess, "run", return_value=completed):
         assert binary_management.binary_version("/opt/x/node_exporter") is None
+
+
+def test_binary_version_runs_the_binary_as_the_unprivileged_service_user():
+    completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    with patch.object(binary_management.subprocess, "run", return_value=completed) as run:
+        binary_management.binary_version("/opt/x/node_exporter")
+    # THEN the downloaded executable does not inherit the hook's root privileges,
+    # including root's supplementary groups
+    kwargs = run.call_args.kwargs
+    assert kwargs["user"] == NODE_EXPORTER_BINARY_USER
+    assert kwargs["group"] == NODE_EXPORTER_BINARY_GROUP
+    assert kwargs["extra_groups"] == []
+
+
+def test_binary_version_is_none_when_the_service_user_does_not_exist():
+    # GIVEN no node-exporter user on the machine: subprocess resolves the user name
+    # itself and raises KeyError before anything is executed
+    with patch.object(
+        binary_management.pwd, "getpwnam", side_effect=KeyError("node-exporter")
+    ):
+        # THEN the binary is not run as root instead; callers fall back to the
+        # conservative collector set
+        assert binary_management.binary_version("/bin/true") is None
 
 
 # --- systemd unit rendering -------------------------------------------------
@@ -341,7 +440,7 @@ def _sync(tmp_path, url="https://example.com/v1", port=9100, force_restart=False
         patch.object(binary_management, "ensure_user"),
         patch.object(binary_management, "is_installed", _real_is_installed),
         patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
-        patch.object(binary_management.urllib.request, "urlopen", _urlopen_returning(payload)),
+        patch.object(binary_management._OPENER, "open", _urlopen_returning(payload)),
     ):
         _real_sync_node_exporter_service(
             url,
@@ -375,7 +474,7 @@ def test_sync_creates_the_service_user(tmp_path):
         patch.object(binary_management, "ensure_user") as ensure_user,
         patch.object(binary_management, "is_installed", _real_is_installed),
         patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
-        patch.object(binary_management.urllib.request, "urlopen", _urlopen_returning(b"ELF")),
+        patch.object(binary_management._OPENER, "open", _urlopen_returning(b"ELF")),
     ):
         _real_sync_node_exporter_service(
             "https://example.com/v1",
@@ -407,7 +506,7 @@ def test_sync_skips_the_download_when_the_url_is_unchanged(tmp_path):
         patch.object(binary_management, "ensure_user"),
         patch.object(binary_management, "is_installed", _real_is_installed),
         patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
-        patch.object(binary_management.urllib.request, "urlopen") as urlopen,
+        patch.object(binary_management._OPENER, "open") as urlopen,
     ):
         _real_sync_node_exporter_service(
             "https://example.com/v1",
@@ -459,7 +558,7 @@ def test_sync_restarts_when_only_the_port_changed(tmp_path):
         patch.object(binary_management, "ensure_user"),
         patch.object(binary_management, "is_installed", _real_is_installed),
         patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
-        patch.object(binary_management.urllib.request, "urlopen") as urlopen,
+        patch.object(binary_management._OPENER, "open") as urlopen,
     ):
         # WHEN syncing with a different port
         _real_sync_node_exporter_service(
@@ -489,7 +588,7 @@ def test_sync_restarts_when_the_service_is_not_running(tmp_path):
         patch.object(binary_management, "ensure_user"),
         patch.object(binary_management, "is_installed", _real_is_installed),
         patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
-        patch.object(binary_management.urllib.request, "urlopen") as urlopen,
+        patch.object(binary_management._OPENER, "open") as urlopen,
     ):
         _real_sync_node_exporter_service(
             "https://example.com/v1", 9100,
@@ -515,7 +614,7 @@ def test_sync_force_restart(tmp_path):
         patch.object(binary_management, "ensure_user"),
         patch.object(binary_management, "is_installed", _real_is_installed),
         patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
-        patch.object(binary_management.urllib.request, "urlopen"),
+        patch.object(binary_management._OPENER, "open"),
     ):
         _real_sync_node_exporter_service(
             "https://example.com/v1", 9100,
@@ -539,7 +638,7 @@ def test_sync_raises_binary_service_error_on_restart_failure(tmp_path):
         patch.object(binary_management, "ensure_user"),
         patch.object(binary_management, "is_installed", _real_is_installed),
         patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
-        patch.object(binary_management.urllib.request, "urlopen", _urlopen_returning(b"ELF")),
+        patch.object(binary_management._OPENER, "open", _urlopen_returning(b"ELF")),
     ):
         # THEN a typed error is raised for the charm to turn into BlockedStatus
         with pytest.raises(binary_management.BinaryServiceError):
@@ -569,7 +668,7 @@ def test_sync_raises_binary_service_error_when_daemon_reload_raises_oserror(tmp_
         patch.object(binary_management, "ensure_user"),
         patch.object(binary_management, "is_installed", _real_is_installed),
         patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
-        patch.object(binary_management.urllib.request, "urlopen", _urlopen_returning(b"ELF")),
+        patch.object(binary_management._OPENER, "open", _urlopen_returning(b"ELF")),
     ):
         # THEN a typed error is raised, not the bare OSError
         with pytest.raises(binary_management.BinaryServiceError):
@@ -595,7 +694,7 @@ def test_sync_raises_binary_service_error_when_restart_raises_oserror(tmp_path):
         patch.object(binary_management, "ensure_user"),
         patch.object(binary_management, "is_installed", _real_is_installed),
         patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
-        patch.object(binary_management.urllib.request, "urlopen", _urlopen_returning(b"ELF")),
+        patch.object(binary_management._OPENER, "open", _urlopen_returning(b"ELF")),
     ):
         # THEN a typed error is raised, not the bare OSError
         with pytest.raises(binary_management.BinaryServiceError):
@@ -623,7 +722,7 @@ def test_sync_raises_binary_service_error_when_unit_file_write_fails(tmp_path):
         patch.object(binary_management, "ensure_user"),
         patch.object(binary_management, "is_installed", _real_is_installed),
         patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
-        patch.object(binary_management.urllib.request, "urlopen", _urlopen_returning(b"ELF")),
+        patch.object(binary_management._OPENER, "open", _urlopen_returning(b"ELF")),
         patch.object(
             binary_management.LocalPath,
             "write_text",
@@ -660,7 +759,7 @@ def test_sync_restarts_when_service_running_raises_oserror(tmp_path):
         patch.object(binary_management, "ensure_user"),
         patch.object(binary_management, "is_installed", _real_is_installed),
         patch.object(binary_management, "binary_version", return_value=(1, 10, 2)),
-        patch.object(binary_management.urllib.request, "urlopen") as urlopen,
+        patch.object(binary_management._OPENER, "open") as urlopen,
     ):
         # WHEN everything else is unchanged but the running-state check itself fails
         _real_sync_node_exporter_service(
@@ -680,7 +779,7 @@ def test_sync_propagates_download_failure(tmp_path):
         patch.object(binary_management.systemd, "service_running", return_value=True),
         patch.object(binary_management, "ensure_user"),
         patch.object(binary_management, "is_installed", _real_is_installed),
-        patch.object(binary_management.urllib.request, "urlopen", side_effect=OSError("404")),
+        patch.object(binary_management._OPENER, "open", side_effect=OSError("404")),
     ):
         with pytest.raises(binary_management.BinaryDownloadError):
             _real_sync_node_exporter_service(

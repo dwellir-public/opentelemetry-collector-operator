@@ -52,6 +52,7 @@ from constants import (
 from singleton_snap import SingletonSnapManager, normalize_unit_name
 from snap_fstab import SnapFstab
 from snap_management import (
+    SnapError,
     SnapMap,
     SnapServiceError,
     SnapSpecError,
@@ -928,11 +929,13 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
         other_removed = self._drop_node_exporter_binary() or deb_removed
         if not self.snap("node-exporter").present:
             self.unit.status = MaintenanceStatus("Installing node-exporter snap")
-            install_snap("node-exporter")
             try:
+                install_snap("node-exporter")
                 self.snap("node-exporter").start(enable=True)
-            except snap.SnapError as e:
-                raise SnapServiceError("Failed to start node-exporter") from e
+            # SnapSpecError is not a SnapError, and the snap lib raises its own.
+            except (snap.SnapError, SnapError, SnapSpecError) as e:
+                logger.error(f"Failed to install or start the node-exporter snap: {e}")
+                return "Failed to install or start the node-exporter snap; see debug-log"
         SingletonSnapManager(self.unit.name).register(
             "node-exporter", SnapMap.get_revision("node-exporter")
         )

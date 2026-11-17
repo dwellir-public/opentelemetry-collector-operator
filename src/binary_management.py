@@ -68,6 +68,25 @@ class BinaryServiceError(BinaryError):
     """Raised when the charm-managed systemd service fails to (re)start."""
 
 
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow only redirects that stay on http(s) and never downgrade https.
+
+    validate_url only sees the configured URL. urllib's default handler also
+    follows redirects to ftp, and from https to http, either of which would
+    fetch the executable over an unauthenticated transport.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old_scheme = urlparse(req.full_url).scheme
+        new_scheme = urlparse(newurl).scheme
+        if new_scheme not in ("http", "https") or (old_scheme == "https" and new_scheme != "https"):
+            raise URLError(f"refusing redirect from {req.full_url} to {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_SafeRedirectHandler)
+
+
 def validate_url(url: str) -> None:
     """Check that url is a well-formed http(s) URL.
 
@@ -175,7 +194,7 @@ def download_binary(
         raise BinaryDownloadError(f"Failed to prepare {destination.parent} for download") from e
     try:
         with os.fdopen(tmp_fd, "wb") as tmp_file:
-            with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+            with _OPENER.open(url, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
                 shutil.copyfileobj(response, tmp_file)
         os.chmod(tmp_name, 0o755)
         os.replace(tmp_name, binary_path)
@@ -195,8 +214,16 @@ def download_binary(
     log.info(f"installed the node-exporter binary at {binary_path}")
 
 
-def binary_version(binary_path: str = NODE_EXPORTER_BINARY_PATH) -> Optional[Version]:
+def binary_version(
+    binary_path: str = NODE_EXPORTER_BINARY_PATH,
+    user: str = NODE_EXPORTER_BINARY_USER,
+    group: str = NODE_EXPORTER_BINARY_GROUP,
+) -> Optional[Version]:
     """Return the version the installed binary reports, or None if unknown.
+
+    The binary comes from a URL, so it is probed as the unprivileged service
+    user rather than with the hook's root privileges; extra_groups=[] also
+    drops root's supplementary groups, which user/group alone would keep.
 
     `node_exporter --version` prints a banner such as
     'node_exporter, version 1.10.2 (branch: HEAD, revision: ...)', on stderr in
@@ -209,8 +236,12 @@ def binary_version(binary_path: str = NODE_EXPORTER_BINARY_PATH) -> Optional[Ver
             capture_output=True,
             text=True,
             timeout=VERSION_TIMEOUT_SECONDS,
+            user=user,
+            group=group,
+            extra_groups=[],
         )
-    except (OSError, subprocess.SubprocessError) as e:
+    # KeyError: subprocess could not resolve the service user or group.
+    except (OSError, subprocess.SubprocessError, KeyError) as e:
         log.warning(f"could not determine the node-exporter binary version: {e}")
         return None
     match = re.search(r"version\s+v?(\d+\.\d+(?:\.\d+)?)", f"{result.stdout}\n{result.stderr}")
