@@ -61,6 +61,17 @@ def test_build_collector_flags_drops_collectors_newer_than_the_binary():
     assert "--collector.systemd" in flags
 
 
+def test_build_collector_flags_keeps_gated_collectors_on_resolute_deb():
+    """Ubuntu 26.04 (resolute) ships the 1.10.2 deb, which knows every charm collector."""
+    # WHEN building flags from the deb version string found on resolute
+    version = parse_version("1.10.2-1")
+    flags = build_collector_flags(9100, "/tmp/textfile", version=version)
+    # THEN the version is parsed and the version-gated collectors are kept
+    assert version == (1, 10, 2)
+    assert "--collector.drm" in flags
+    assert "--collector.sysctl" in flags
+
+
 def test_build_collector_flags_is_conservative_when_version_unknown():
     # WHEN the installed version cannot be determined
     flags = build_collector_flags(9100, "/tmp/textfile", version=None)

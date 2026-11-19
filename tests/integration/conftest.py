@@ -3,6 +3,7 @@
 # See LICENSE file for licensing details.
 """Conftest file for integration tests."""
 
+import re
 import subprocess
 from pytest import fixture
 from pytest_jubilant import pack
@@ -23,6 +24,11 @@ CONFIG_BUILDER_PATH = Path(__file__).parent.parent.parent / "src" / "config_buil
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _base_version(platform: str) -> str:
+    """Return the Ubuntu version of a platform, e.g. '24.04' for 'ubuntu@24.04:amd64'."""
+    return platform.split("@")[1].split(":")[0]
+
+
 def charm_and_channel(charm_path_key: str, charm_channel_key: str, platform: str) -> tuple[str, str | None]:
     """Opentelemetry-collector charm used for integration testing.
 
@@ -35,9 +41,9 @@ def charm_and_channel(charm_path_key: str, charm_channel_key: str, platform: str
     if path_from_env := os.getenv(charm_path_key):
         charm_path = str(Path(path_from_env).absolute())
         logger.info("Using local charm: %s", charm_path)
-        if "22.04" in platform:
-            return charm_path.replace("24.04", "22.04"), None
-        return charm_path, None
+        # CHARM_PATH points at the charm for one base; the charms for the other
+        # bases sit next to it, differing only by the base in the file name.
+        return re.sub(r"(22|24|26)\.04", _base_version(platform), charm_path), None
     for _ in range(3):
         logger.info("packing Opentelemetry-collector charm ...")
         try:
@@ -61,6 +67,12 @@ def charm_22_04() -> str:
     """Charm (platform = ubuntu@22.04) used for integration testing."""
     # Note: Use '22.04' in integration tests with Zookeeper, because that's Zookeeper's base
     return charm_and_channel("CHARM_PATH", "CHARM_CHANNEL", platform="ubuntu@22.04:amd64")[0]
+
+
+@pytest.fixture(scope="session")
+def charm_26_04() -> str:
+    """Charm (platform = ubuntu@26.04) used for integration testing."""
+    return charm_and_channel("CHARM_PATH", "CHARM_CHANNEL", platform="ubuntu@26.04:amd64")[0]
 
 
 @pytest.fixture(scope="module")
