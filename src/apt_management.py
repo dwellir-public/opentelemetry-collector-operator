@@ -10,8 +10,8 @@ from /etc/default/prometheus-node-exporter. This module writes that file so
 the apt flavor captures the same collectors and listen port as the snap.
 
 Unlike the snap (pinned to a charm-chosen revision), the deb version depends
-on the machine's Ubuntu release (e.g. 1.3.1 on jammy, 1.7.0 on noble), so
-collector flags that the installed version does not know are filtered out by
+on the machine's Ubuntu release (e.g. 1.3.1 on jammy, 1.7.0 on noble, 1.10.2
+on resolute), so collector flags that the installed version does not know are filtered out by
 node_exporter_flags — node_exporter exits on unknown flags, which would leave
 the service down.
 """
